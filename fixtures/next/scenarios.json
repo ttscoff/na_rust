@@ -1,0 +1,24 @@
+{
+  "scenarios": [
+    {
+      "name": "default next excludes done and archive",
+      "fixture": "base.taskpaper",
+      "args": []
+    },
+    {
+      "name": "filtered next includes comparison expression",
+      "fixture": "base.taskpaper",
+      "args": [
+        "@search(@priority > 3 and @context contains \"home\")"
+      ]
+    },
+    {
+      "name": "first available in filtered mode",
+      "fixture": "base.taskpaper",
+      "args": [
+        "@search(@context contains \"office\")",
+        "--available"
+      ]
+    }
+  ]
+}
