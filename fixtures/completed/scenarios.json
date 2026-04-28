@@ -1,0 +1,19 @@
+{
+  "scenarios": [
+    {
+      "name": "completed default listing",
+      "fixture": "base.taskpaper",
+      "args": []
+    },
+    {
+      "name": "completed pattern filter",
+      "fixture": "base.taskpaper",
+      "args": ["feature"]
+    },
+    {
+      "name": "completed tagged filter",
+      "fixture": "base.taskpaper",
+      "args": ["--tagged", "review"]
+    }
+  ]
+}

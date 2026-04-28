@@ -4,11 +4,15 @@ use std::path::PathBuf;
 #[derive(Debug, Parser)]
 #[command(
     name = "na",
-    version,
+    disable_version_flag = true,
     about = "Rust rewrite of na TaskPaper CLI",
     long_about = None
 )]
 pub struct Cli {
+    /// Print version and exit.
+    #[arg(short = 'v', long = "version", default_value_t = false)]
+    pub version: bool,
+
     /// Override file extension when searching for TaskPaper files.
     #[arg(short, long, default_value = "taskpaper")]
     pub extension: String,
@@ -22,7 +26,7 @@ pub struct Cli {
     pub no_color: bool,
 
     #[command(subcommand)]
-    pub command: Commands,
+    pub command: Option<Commands>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -33,17 +37,54 @@ pub enum Commands {
     /// Find actions by search terms.
     #[command(visible_aliases = ["grep", "search"])]
     Find(FindArgs),
+    /// Find actions matching tag expressions.
+    Tagged(TaggedArgs),
     /// Add a new action.
     Add(AddArgs),
     /// Update existing actions.
     Update(UpdateArgs),
+    /// Edit action text/notes directly.
+    Edit(EditArgs),
     /// Mark actions complete.
+    #[command(visible_alias = "finish")]
     Complete(UpdateArgs),
+    /// Mark actions done and move to Archive.
+    Archive(ArchiveArgs),
+    /// Display completed actions.
+    #[command(visible_alias = "finished")]
+    Completed(CompletedArgs),
+    /// Restore completed actions (alias: unfinish).
+    #[command(visible_alias = "unfinish")]
+    Restore(UpdateArgs),
+    /// Move actions to another project.
+    Move(MoveArgs),
+    /// Add/remove/replace tags on actions.
+    Tag(TagArgs),
+    /// Open todo files in editor.
+    Open(OpenArgs),
+    /// List projects in todo files.
+    Projects(ProjectsArgs),
+    /// List known todo files.
+    Todos(TodosArgs),
+    /// Undo last backup state.
+    Undo(UndoArgs),
+    /// Scan directory tree for todo files.
+    Scan(ScanArgs),
+    /// Initialize a new todo file.
+    #[command(visible_alias = "create")]
+    Init,
+    /// Show prompt scripts.
+    Prompt(PromptArgs),
+    /// Show changelog.
+    #[command(visible_alias = "changelog")]
+    Changes,
+    /// Manage saved `next` search definitions.
+    Saved(SavedArgs),
     /// Inspect or run plugins.
     Plugin(PluginArgs),
 }
 
-#[derive(Debug, Args)]
+#[derive(Debug, Clone, Args)]
 pub struct NextArgs {
     /// Optional TaskPaper-style filter expression.
     #[arg(value_name = "FILTER")]
@@ -72,13 +113,241 @@ pub struct NextArgs {
     /// Display matches from known todo files in history.
     #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
     pub in_todo: Vec<String>,
+
+    /// Include @done actions.
+    #[arg(long, default_value_t = false)]
+    pub done: bool,
+
+    /// Alternate next-action tag.
+    #[arg(short = 't', long, value_name = "TAG")]
+    pub tag: Option<String>,
+
+    /// Filter by project name.
+    #[arg(long = "project", visible_alias = "proj", value_name = "PROJECT")]
+    pub project: Option<String>,
+
+    /// Match actions containing tag/value expressions.
+    #[arg(long, value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+
+    /// Match actions by priority value/comparison.
+    #[arg(short = 'p', long = "priority", visible_alias = "prio", value_name = "PRIORITY", num_args = 0..)]
+    pub priority: Vec<String>,
+
+    /// Filter results using text query (repeatable).
+    #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+    pub search: Vec<String>,
+
+    /// Treat search query as regex.
+    #[arg(long, default_value_t = false)]
+    pub regex: bool,
+
+    /// Treat search query as exact phrase match.
+    #[arg(long, default_value_t = false)]
+    pub exact: bool,
+
+    /// Include notes while searching.
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+
+    /// Exclude notes while searching (pairs with --search-notes).
+    #[arg(long = "no-search-notes", default_value_t = false)]
+    pub no_search_notes: bool,
+
+    /// Include notes in output.
+    #[arg(long, default_value_t = false)]
+    pub notes: bool,
+
+    /// Omit notes from output (pairs with --notes).
+    #[arg(long = "no-notes", default_value_t = false)]
+    pub no_notes: bool,
+
+    /// Omit filename prefix in output.
+    #[arg(long = "no-file", default_value_t = false)]
+    pub no_file: bool,
+
+    /// Group output by todo file.
+    #[arg(long, default_value_t = false)]
+    pub nest: bool,
+
+    /// Nested by file and by project.
+    #[arg(long, default_value_t = false)]
+    pub omnifocus: bool,
+
+    /// Run plugin on resulting actions (stdout only).
+    #[arg(long, value_name = "NAME")]
+    pub plugin: Option<String>,
+
+    /// Plugin stdin format (json|yaml|csv|text).
+    #[arg(long, value_name = "TYPE")]
+    pub input: Option<String>,
+
+    /// Plugin stdout format (json|yaml|csv|text).
+    #[arg(long, value_name = "TYPE")]
+    pub output: Option<String>,
+
+    /// Divider string for text-divider plugin I/O.
+    #[arg(long, value_name = "STRING")]
+    pub divider: Option<String>,
+
+    /// Show per-action durations and total.
+    #[arg(long, default_value_t = false)]
+    pub times: bool,
+
+    /// Format durations in human-friendly form.
+    #[arg(long, default_value_t = false)]
+    pub human: bool,
+
+    /// Show only actions with both @started and @done.
+    #[arg(long = "only-timed", default_value_t = false)]
+    pub only_timed: bool,
+
+    /// Output times as JSON object (implies --times and --done).
+    #[arg(long = "json-times", default_value_t = false)]
+    pub json_times: bool,
+
+    /// Output only elapsed totals (implies --times and --done).
+    #[arg(long = "only-times", default_value_t = false)]
+    pub only_times: bool,
+
+    /// Save this search definition under the data directory for later reuse.
+    #[arg(long, value_name = "TITLE")]
+    pub save: Option<String>,
 }
 
-#[derive(Debug, Args)]
+impl NextArgs {
+    pub fn effective_search_notes(&self) -> bool {
+        self.search_notes && !self.no_search_notes
+    }
+
+    pub fn effective_notes(&self) -> bool {
+        self.notes && !self.no_notes
+    }
+
+    pub fn nest_for_display(&self) -> bool {
+        self.nest || self.omnifocus
+    }
+}
+
+#[derive(Debug, Clone, Args)]
 pub struct FindArgs {
     /// Search query terms or @search(...) expression.
     #[arg(value_name = "QUERY")]
     pub query: String,
+
+    /// Interpret search pattern as regular expression.
+    #[arg(short = 'e', long = "regex", default_value_t = false)]
+    pub regex: bool,
+
+    /// Match pattern exactly.
+    #[arg(short = 'x', long = "exact", default_value_t = false)]
+    pub exact: bool,
+
+    /// Recurse to depth when discovering files.
+    #[arg(short = 'd', long = "depth")]
+    pub depth: Option<usize>,
+
+    /// Restrict to known todo files matching tokens.
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+
+    /// Include notes while searching.
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+
+    /// Exclude notes while searching.
+    #[arg(long = "no-search-notes", default_value_t = false)]
+    pub no_search_notes: bool,
+
+    /// Combine search tokens with OR semantics.
+    #[arg(short = 'o', long = "or", default_value_t = false)]
+    pub or_mode: bool,
+
+    /// Restrict by project.
+    #[arg(long = "project", visible_alias = "proj", value_name = "PROJECT")]
+    pub project: Option<String>,
+
+    /// Restrict by tag(s) presence.
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+
+    /// Include done actions.
+    #[arg(long, default_value_t = false)]
+    pub done: bool,
+
+    /// Invert match results.
+    #[arg(short = 'v', long = "invert", default_value_t = false)]
+    pub invert: bool,
+
+    /// Save this query as a named search.
+    #[arg(long, value_name = "TITLE")]
+    pub save: Option<String>,
+
+    /// Include notes in output.
+    #[arg(long, default_value_t = false)]
+    pub notes: bool,
+
+    /// Omit notes in output.
+    #[arg(long = "no-notes", default_value_t = false)]
+    pub no_notes: bool,
+
+    /// Group output by file.
+    #[arg(long, default_value_t = false)]
+    pub nest: bool,
+
+    /// Omit filename in output.
+    #[arg(long = "no-file", default_value_t = false)]
+    pub no_file: bool,
+
+    /// Group output by file and project.
+    #[arg(long, default_value_t = false)]
+    pub omnifocus: bool,
+
+    /// Show per-action durations and total.
+    #[arg(long, default_value_t = false)]
+    pub times: bool,
+
+    /// Format durations in human-friendly form.
+    #[arg(long, default_value_t = false)]
+    pub human: bool,
+
+    /// Run plugin on resulting actions.
+    #[arg(long, value_name = "NAME")]
+    pub plugin: Option<String>,
+
+    /// Plugin stdin format.
+    #[arg(long, value_name = "TYPE")]
+    pub input: Option<String>,
+
+    /// Plugin stdout format.
+    #[arg(long, value_name = "TYPE")]
+    pub output: Option<String>,
+
+    /// Divider string for plugin I/O.
+    #[arg(long, value_name = "STRING")]
+    pub divider: Option<String>,
+}
+
+impl FindArgs {
+    pub fn effective_search_notes(&self) -> bool {
+        self.search_notes && !self.no_search_notes
+    }
+
+    pub fn effective_notes(&self) -> bool {
+        self.notes && !self.no_notes
+    }
+
+    pub fn nest_for_display(&self) -> bool {
+        self.nest || self.omnifocus
+    }
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct TaggedArgs {
+    #[arg(value_name = "TAG", num_args = 0..)]
+    pub tags: Vec<String>,
+    #[command(flatten)]
+    pub find: FindArgs,
 }
 
 #[derive(Debug, Args)]
@@ -86,25 +355,372 @@ pub struct AddArgs {
     /// Action text to append.
     #[arg(value_name = "TEXT")]
     pub text: String,
+
+    /// Started time string (ISO or natural-language style token).
+    #[arg(long, value_name = "DATE")]
+    pub started: Option<String>,
+
+    /// End/finished time string.
+    #[arg(long = "end", visible_alias = "finished", value_name = "DATE")]
+    pub end: Option<String>,
+
+    /// Duration token (e.g. 45m, 2h).
+    #[arg(long, value_name = "DURATION")]
+    pub duration: Option<String>,
+
+    /// Add action to specific project.
+    #[arg(long = "to", visible_aliases = ["project", "proj"], value_name = "PROJECT", default_value = "Inbox")]
+    pub project: String,
+
+    /// Add task at start or end of target project.
+    #[arg(long, value_name = "POSITION")]
+    pub at: Option<String>,
+
+    /// Add to a known todo file (partial match).
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+
+    /// Add a priority level 1-5 or h/m/l.
+    #[arg(short = 'p', long = "priority", value_name = "PRIO")]
+    pub priority: Option<String>,
+
+    /// Use a tag other than default next-action tag.
+    #[arg(short = 't', long = "tag", value_name = "TAG")]
+    pub tag: Option<String>,
+
+    /// Don't add next-action tag to the new entry.
+    #[arg(short = 'x', default_value_t = false)]
+    pub no_next_tag: bool,
+
+    /// Specify exact file path to add into.
+    #[arg(short = 'f', long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Mark task as done.
+    #[arg(long = "finish", visible_alias = "done", default_value_t = false)]
+    pub finish: bool,
+
+    /// Search for files this many directories deep.
+    #[arg(short = 'd', long = "depth", default_value_t = 1)]
+    pub depth: usize,
+
+    /// Include stdin note lines when provided.
+    #[arg(short = 'n', long = "note", default_value_t = false)]
+    pub note: bool,
 }
 
 #[derive(Debug, Args, Clone)]
 pub struct UpdateArgs {
-    /// Search query for selecting actions.
+    /// Optional search query for selecting actions.
     #[arg(value_name = "QUERY")]
-    pub query: String,
+    pub query: Option<String>,
 
     /// Tags to add (e.g. @today @home).
     #[arg(short, long, value_name = "TAG", num_args = 0..)]
     pub tag: Vec<String>,
 
     /// Tags to remove (e.g. @today @home).
-    #[arg(long, value_name = "TAG", num_args = 0..)]
+    #[arg(long, visible_alias = "remove", value_name = "TAG", num_args = 0..)]
     pub untag: Vec<String>,
 
     /// Mark action as done.
+    #[arg(long, visible_alias = "finish", default_value_t = false)]
+    pub done: bool,
+
+    /// Restrict updates to a specific file path.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Search for todo files this many levels deep.
+    #[arg(short = 'd', long, default_value_t = 1)]
+    pub depth: usize,
+
+    /// Restrict updates to known todo files matching tokens.
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+
+    /// Additional search terms used as a fallback filter.
+    #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+    pub search: Vec<String>,
+
+    /// Update all matches immediately (skip interactive selection).
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+
+    /// Replace action text for selected items.
+    #[arg(long, value_name = "TEXT")]
+    pub replace: Option<String>,
+
+    /// Move selected actions to another project.
+    #[arg(long = "to", visible_alias = "move", value_name = "PROJECT")]
+    pub to: Option<String>,
+
+    /// Restrict by project.
+    #[arg(long = "project", visible_alias = "proj", value_name = "PROJECT")]
+    pub project: Option<String>,
+
+    /// Restrict by tag(s) presence.
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+
+    /// Treat query as regex.
+    #[arg(short = 'e', long = "regex", default_value_t = false)]
+    pub regex: bool,
+
+    /// Treat query as exact text.
+    #[arg(short = 'x', long = "exact", default_value_t = false)]
+    pub exact: bool,
+
+    /// Include notes while searching.
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+
+    /// Exclude notes while searching.
+    #[arg(long = "no-search-notes", default_value_t = false)]
+    pub no_search_notes: bool,
+
+    /// Set priority value.
+    #[arg(short = 'p', long = "priority", value_name = "PRIORITY")]
+    pub priority: Option<String>,
+
+    /// Insert/move position hint.
+    #[arg(long = "at", value_name = "POSITION")]
+    pub at: Option<String>,
+
+    /// Archive selected actions.
+    #[arg(short = 'a', long = "archive", default_value_t = false)]
+    pub archive: bool,
+
+    /// Trigger edit semantics.
+    #[arg(long = "edit", default_value_t = false)]
+    pub edit: bool,
+
+    /// Delete selected actions.
+    #[arg(long, default_value_t = false)]
+    pub delete: bool,
+
+    /// Restore selected actions from Archive to Inbox.
+    #[arg(long, default_value_t = false)]
+    pub restore: bool,
+
+    /// Append note(s) to selected actions.
+    #[arg(long = "note", value_name = "NOTE", num_args = 0..)]
+    pub note: Vec<String>,
+
+    /// Replace existing notes instead of appending.
+    #[arg(long = "overwrite-notes", default_value_t = false)]
+    pub overwrite_notes: bool,
+
+    /// Set started timestamp token.
+    #[arg(long = "started", value_name = "DATE")]
+    pub started: Option<String>,
+
+    /// Set done timestamp token explicitly.
+    #[arg(long = "end", visible_alias = "finished", value_name = "DATE")]
+    pub end: Option<String>,
+
+    /// Set duration tag value.
+    #[arg(long = "duration", value_name = "DURATION")]
+    pub duration: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct EditArgs {
+    /// Query selecting the action to edit.
+    #[arg(value_name = "QUERY")]
+    pub query: Option<String>,
+
+    /// Set replacement action text.
+    #[arg(long = "text", value_name = "TEXT")]
+    pub text: String,
+
+    /// Restrict edits to a specific file path.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Search for todo files this many levels deep.
+    #[arg(short = 'd', long, default_value_t = 1)]
+    pub depth: usize,
+
+    /// Restrict edits to known todo files matching tokens.
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+
+    /// Additional search terms used as a fallback filter.
+    #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+    pub search: Vec<String>,
+
+    /// Edit all matched actions.
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct ArchiveArgs {
+    /// Optional action query.
+    #[arg(value_name = "QUERY")]
+    pub query: Option<String>,
+
+    /// Archive all already-done tasks.
     #[arg(long, default_value_t = false)]
     pub done: bool,
+
+    /// Restrict actions to a specific file path.
+    #[arg(long, value_name = "PATH")]
+    pub file: Option<PathBuf>,
+
+    /// Search for todo files this many levels deep.
+    #[arg(short = 'd', long, default_value_t = 1)]
+    pub depth: usize,
+
+    /// Restrict by tag(s).
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+
+    /// Restrict by project.
+    #[arg(long = "project", visible_alias = "proj", value_name = "PROJECT")]
+    pub project: Option<String>,
+
+    /// Restrict to known todo files matching tokens.
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+
+    /// Additional search terms used as fallback filter.
+    #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+    pub search: Vec<String>,
+
+    /// Interpret query as regex (reserved parity flag).
+    #[arg(short = 'e', long = "regex", default_value_t = false)]
+    pub regex: bool,
+
+    /// Interpret query as exact (reserved parity flag).
+    #[arg(short = 'x', long = "exact", default_value_t = false)]
+    pub exact: bool,
+
+    /// Act on all matches without menu selection.
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+
+    /// Append note(s) to archived actions.
+    #[arg(short = 'n', long = "note", value_name = "NOTE", num_args = 0..)]
+    pub note: Vec<String>,
+
+    /// Replace existing notes instead of appending.
+    #[arg(short = 'o', long = "overwrite", default_value_t = false)]
+    pub overwrite_notes: bool,
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct CompletedArgs {
+    /// Optional pattern tokens to match completed action text.
+    #[arg(value_name = "PATTERN", num_args = 0..)]
+    pub pattern: Vec<String>,
+
+    /// Display actions completed before date/time.
+    #[arg(short = 'b', long = "before", value_name = "DATE")]
+    pub before: Option<String>,
+
+    /// Display actions completed on date.
+    #[arg(long = "on", value_name = "DATE")]
+    pub on: Option<String>,
+
+    /// Display actions completed after date/time.
+    #[arg(short = 'a', long = "after", value_name = "DATE")]
+    pub after: Option<String>,
+
+    /// Combine before/on/after ranges with OR semantics.
+    #[arg(short = 'o', long = "or", default_value_t = false)]
+    pub or_mode: bool,
+
+    /// Recurse to depth when searching for files.
+    #[arg(short = 'd', long = "depth")]
+    pub depth: Option<usize>,
+
+    /// Display matches from known todo files in history.
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+
+    /// Include notes in output.
+    #[arg(long, default_value_t = false)]
+    pub notes: bool,
+
+    /// Omit notes from output (pairs with --notes).
+    #[arg(long = "no-notes", default_value_t = false)]
+    pub no_notes: bool,
+
+    /// Include notes while searching.
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+
+    /// Exclude notes while searching.
+    #[arg(long = "no-search-notes", default_value_t = false)]
+    pub no_search_notes: bool,
+
+    /// Restrict by project name.
+    #[arg(long = "project", visible_alias = "proj", value_name = "PROJECT")]
+    pub project: Option<String>,
+
+    /// Restrict by tag(s) presence.
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+
+    /// Group output by todo file.
+    #[arg(long, default_value_t = false)]
+    pub nest: bool,
+
+    /// Nested by file and project.
+    #[arg(long, default_value_t = false)]
+    pub omnifocus: bool,
+
+    /// Save this completed query.
+    #[arg(long, value_name = "TITLE")]
+    pub save: Option<String>,
+}
+
+impl CompletedArgs {
+    pub fn effective_search_notes(&self) -> bool {
+        self.search_notes && !self.no_search_notes
+    }
+
+    pub fn effective_notes(&self) -> bool {
+        self.notes && !self.no_notes
+    }
+
+    pub fn nest_for_display(&self) -> bool {
+        self.nest || self.omnifocus
+    }
+}
+
+#[derive(Debug, Args)]
+pub struct SavedArgs {
+    #[command(subcommand)]
+    pub command: SavedCommands,
+}
+
+#[derive(Debug, Subcommand)]
+pub enum SavedCommands {
+    /// List saved search titles.
+    List,
+    /// Run a saved search.
+    Run {
+        #[arg(value_name = "TITLE")]
+        title: String,
+    },
+    /// Edit a saved search definition.
+    Edit {
+        #[arg(value_name = "TITLE")]
+        title: String,
+        /// Optional editor binary override.
+        #[arg(long, value_name = "EDITOR")]
+        editor: Option<String>,
+    },
+    /// Delete a saved search.
+    Delete {
+        #[arg(value_name = "TITLE")]
+        title: String,
+    },
+    /// Select from saved searches interactively.
+    Select,
 }
 
 #[derive(Debug, Args)]
@@ -123,7 +739,163 @@ pub enum PluginCommands {
         plugin: String,
         #[arg(value_name = "QUERY")]
         query: String,
+        #[arg(long, value_name = "TYPE")]
+        input: Option<String>,
+        #[arg(long, value_name = "TYPE")]
+        output: Option<String>,
+        #[arg(long, value_name = "STRING")]
+        divider: Option<String>,
+        #[arg(long, value_name = "PATH")]
+        file: Option<PathBuf>,
+        #[arg(short = 'd', long = "depth")]
+        depth: Option<usize>,
+        #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+        in_todo: Vec<String>,
+        #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+        search: Vec<String>,
+        #[arg(long, default_value_t = false)]
+        done: bool,
+        #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+        tagged: Vec<String>,
     },
+    /// Enable a plugin by setting executable permissions.
+    Enable {
+        #[arg(value_name = "PLUGIN")]
+        plugin: String,
+    },
+    /// Disable a plugin by removing executable permissions.
+    Disable {
+        #[arg(value_name = "PLUGIN")]
+        plugin: String,
+    },
+    /// Create a new plugin file in the plugins directory.
+    New {
+        #[arg(value_name = "PLUGIN")]
+        plugin: String,
+    },
+    /// Open a plugin file in an editor.
+    Edit {
+        #[arg(value_name = "PLUGIN")]
+        plugin: String,
+        #[arg(long, value_name = "EDITOR")]
+        editor: Option<String>,
+    },
+    /// Generate example plugin fixtures.
+    GenerateExamples,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct MoveArgs {
+    #[arg(value_name = "QUERY")]
+    pub query: Option<String>,
+    #[arg(long = "to", value_name = "PROJECT")]
+    pub to: String,
+    #[arg(long = "at", value_name = "POSITION")]
+    pub at: Option<String>,
+    #[arg(long = "from", value_name = "PROJECT")]
+    pub from: Option<String>,
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+    #[arg(long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
+    #[arg(short = 'd', long = "depth", default_value_t = 1)]
+    pub depth: usize,
+    #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+    pub search: Vec<String>,
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+    #[arg(short = 'e', long = "regex", default_value_t = false)]
+    pub regex: bool,
+    #[arg(short = 'x', long = "exact", default_value_t = false)]
+    pub exact: bool,
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct TagArgs {
+    #[arg(value_name = "TAG", num_args = 0..)]
+    pub tags: Vec<String>,
+    #[arg(value_name = "QUERY")]
+    pub query: Option<String>,
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+    #[arg(long = "done", default_value_t = false)]
+    pub done: bool,
+    #[arg(long = "file", value_name = "PATH")]
+    pub file: Option<PathBuf>,
+    #[arg(short = 'd', long = "depth", default_value_t = 1)]
+    pub depth: usize,
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+    #[arg(short = 'e', long = "regex", default_value_t = false)]
+    pub regex: bool,
+    #[arg(short = 'x', long = "exact", default_value_t = false)]
+    pub exact: bool,
+    #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
+    pub search: Vec<String>,
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+    #[arg(long, default_value_t = false)]
+    pub all: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct OpenArgs {
+    #[arg(long = "in", visible_alias = "todo", value_name = "TODO", num_args = 0..)]
+    pub in_todo: Vec<String>,
+    #[arg(short = 'd', long = "depth", default_value_t = 1)]
+    pub depth: usize,
+    #[arg(short = 'e', long = "editor", value_name = "EDITOR")]
+    pub editor: Option<String>,
+    #[arg(short = 'a', long = "app", value_name = "APP")]
+    pub app: Option<String>,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ProjectsArgs {
+    #[arg(short = 'd', long = "depth", default_value_t = 1)]
+    pub depth: usize,
+    #[arg(short = 'p', long = "paths", default_value_t = false)]
+    pub paths: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct TodosArgs {
+    #[arg(short = 'e', long = "edit", default_value_t = false)]
+    pub edit: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct UndoArgs {
+    #[arg(short = 's', long = "select", visible_alias = "choose", default_value_t = false)]
+    pub select: bool,
+}
+
+#[derive(Debug, Args, Clone)]
+pub struct ScanArgs {
+    #[arg(short = 'd', long = "depth", default_value_t = 3)]
+    pub depth: usize,
+    #[arg(short = 'p', long = "prune", default_value_t = false)]
+    pub prune: bool,
+    #[arg(long = "hidden", default_value_t = false)]
+    pub hidden: bool,
+    #[arg(short = 'n', long = "dry-run", default_value_t = false)]
+    pub dry_run: bool,
+}
+
+#[derive(Debug, Args)]
+pub struct PromptArgs {
+    #[command(subcommand)]
+    pub command: Option<PromptCommands>,
+}
+
+#[derive(Debug, Clone, Subcommand)]
+pub enum PromptCommands {
+    Show,
+    Install,
 }
 
 #[cfg(test)]
@@ -136,7 +908,7 @@ mod tests {
     fn next_available_alias_sets_first_available() {
         let cli = Cli::parse_from(["na", "next", "--available"]);
         match cli.command {
-            Commands::Next(args) => assert!(args.first_available),
+            Some(Commands::Next(args)) => assert!(args.first_available),
             _ => panic!("expected next command"),
         }
     }
@@ -145,7 +917,7 @@ mod tests {
     fn next_file_and_depth_flags_parse() {
         let cli = Cli::parse_from(["na", "next", "--file", "x.taskpaper", "--depth", "3"]);
         match cli.command {
-            Commands::Next(args) => {
+            Some(Commands::Next(args)) => {
                 assert_eq!(args.file, Some(PathBuf::from("x.taskpaper")));
                 assert_eq!(args.depth, Some(3));
             }
@@ -157,8 +929,285 @@ mod tests {
     fn find_command_alias_search_parses() {
         let cli = Cli::parse_from(["na", "search", "@home"]);
         match cli.command {
-            Commands::Find(args) => assert_eq!(args.query, "@home"),
+            Some(Commands::Find(args)) => assert_eq!(args.query, "@home"),
             _ => panic!("expected find command alias"),
+        }
+    }
+
+    #[test]
+    fn version_flag_parses() {
+        let cli = Cli::parse_from(["na", "--version"]);
+        assert!(cli.version);
+    }
+
+    #[test]
+    fn next_no_search_notes_parses() {
+        let cli = Cli::parse_from(["na", "next", "--no-search-notes"]);
+        match cli.command {
+            Some(Commands::Next(args)) => {
+                assert!(args.no_search_notes);
+            }
+            _ => panic!("expected next"),
+        }
+    }
+
+    #[test]
+    fn next_no_notes_parses() {
+        let cli = Cli::parse_from(["na", "next", "--notes", "--no-notes"]);
+        match cli.command {
+            Some(Commands::Next(args)) => assert!(args.no_notes),
+            _ => panic!("expected next"),
+        }
+    }
+
+    #[test]
+    fn add_flags_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "add",
+            "Ship it",
+            "--started",
+            "2026-04-20 09:00",
+            "--end",
+            "2026-04-20 10:00",
+            "--duration",
+            "1h",
+            "--to",
+            "Work",
+            "--at",
+            "start",
+            "--in",
+            "project",
+            "-p",
+            "h",
+            "-t",
+            "next",
+            "-x",
+            "-f",
+            "tasks.taskpaper",
+            "--finish",
+            "-d",
+            "3",
+            "-n",
+        ]);
+        match cli.command {
+            Some(Commands::Add(args)) => {
+                assert_eq!(args.started.as_deref(), Some("2026-04-20 09:00"));
+                assert_eq!(args.end.as_deref(), Some("2026-04-20 10:00"));
+                assert_eq!(args.duration.as_deref(), Some("1h"));
+                assert_eq!(args.project, "Work");
+                assert_eq!(args.at.as_deref(), Some("start"));
+                assert_eq!(args.in_todo, vec!["project".to_string()]);
+                assert_eq!(args.priority.as_deref(), Some("h"));
+                assert_eq!(args.tag.as_deref(), Some("next"));
+                assert!(args.no_next_tag);
+                assert_eq!(args.file, Some(PathBuf::from("tasks.taskpaper")));
+                assert!(args.finish);
+                assert_eq!(args.depth, 3);
+                assert!(args.note);
+            }
+            _ => panic!("expected add"),
+        }
+    }
+
+    #[test]
+    fn update_flags_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "update",
+            "--tag",
+            "@home",
+            "--remove",
+            "@na",
+            "--replace",
+            "new text",
+            "--to",
+            "Inbox",
+            "--note",
+            "one",
+            "--overwrite-notes",
+            "--restore",
+            "--finish",
+            "--file",
+            "tasks.taskpaper",
+            "--in",
+            "work",
+            "--search",
+            "needle",
+            "--all",
+            "-d",
+            "3",
+            "task text",
+        ]);
+        match cli.command {
+            Some(Commands::Update(args)) => {
+                assert_eq!(args.query.as_deref(), Some("task text"));
+                assert_eq!(args.tag, vec!["@home".to_string()]);
+                assert_eq!(args.untag, vec!["@na".to_string()]);
+                assert!(args.done);
+                assert_eq!(args.replace.as_deref(), Some("new text"));
+                assert_eq!(args.to.as_deref(), Some("Inbox"));
+                assert_eq!(args.note, vec!["one".to_string()]);
+                assert!(args.overwrite_notes);
+                assert!(args.restore);
+                assert_eq!(args.file, Some(PathBuf::from("tasks.taskpaper")));
+                assert_eq!(args.in_todo, vec!["work".to_string()]);
+                assert_eq!(args.search, vec!["needle".to_string()]);
+                assert!(args.all);
+                assert_eq!(args.depth, 3);
+            }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
+    fn edit_flags_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "edit",
+            "--text",
+            "new body",
+            "--file",
+            "tasks.taskpaper",
+            "--in",
+            "work",
+            "--search",
+            "needle",
+            "--all",
+            "-d",
+            "3",
+            "task text",
+        ]);
+        match cli.command {
+            Some(Commands::Edit(args)) => {
+                assert_eq!(args.query.as_deref(), Some("task text"));
+                assert_eq!(args.text, "new body");
+                assert_eq!(args.file, Some(PathBuf::from("tasks.taskpaper")));
+                assert_eq!(args.in_todo, vec!["work".to_string()]);
+                assert_eq!(args.search, vec!["needle".to_string()]);
+                assert!(args.all);
+                assert_eq!(args.depth, 3);
+            }
+            _ => panic!("expected edit command"),
+        }
+    }
+
+    #[test]
+    fn complete_finish_alias_parses() {
+        let cli = Cli::parse_from(["na", "finish", "task text"]);
+        match cli.command {
+            Some(Commands::Complete(args)) => assert_eq!(args.query.as_deref(), Some("task text")),
+            _ => panic!("expected complete via finish alias"),
+        }
+    }
+
+    #[test]
+    fn archive_flags_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "archive",
+            "--done",
+            "--file",
+            "tasks.taskpaper",
+            "--depth",
+            "3",
+            "--tagged",
+            "home",
+            "--project",
+            "Work",
+            "--in",
+            "work",
+            "--search",
+            "token",
+            "--regex",
+            "--exact",
+            "--all",
+            "task text",
+        ]);
+        match cli.command {
+            Some(Commands::Archive(args)) => {
+                assert_eq!(args.query.as_deref(), Some("task text"));
+                assert!(args.done);
+                assert_eq!(args.file, Some(PathBuf::from("tasks.taskpaper")));
+                assert_eq!(args.depth, 3);
+                assert_eq!(args.tagged, vec!["home".to_string()]);
+                assert_eq!(args.project.as_deref(), Some("Work"));
+                assert_eq!(args.in_todo, vec!["work".to_string()]);
+                assert_eq!(args.search, vec!["token".to_string()]);
+                assert!(args.regex);
+                assert!(args.exact);
+                assert!(args.all);
+            }
+            _ => panic!("expected archive command"),
+        }
+    }
+
+    #[test]
+    fn completed_finished_alias_parses() {
+        let cli = Cli::parse_from(["na", "finished", "--before", "2026-04-20", "feature"]);
+        match cli.command {
+            Some(Commands::Completed(args)) => {
+                assert_eq!(args.before.as_deref(), Some("2026-04-20"));
+                assert_eq!(args.pattern, vec!["feature".to_string()]);
+            }
+            _ => panic!("expected completed via finished alias"),
+        }
+    }
+
+    #[test]
+    fn saved_run_subcommand_parses() {
+        let cli = Cli::parse_from(["na", "saved", "run", "Weekly Focus"]);
+        match cli.command {
+            Some(Commands::Saved(args)) => match args.command {
+                super::SavedCommands::Run { title } => assert_eq!(title, "Weekly Focus"),
+                _ => panic!("expected saved run"),
+            },
+            _ => panic!("expected saved"),
+        }
+    }
+
+    #[test]
+    fn saved_edit_editor_override_parses() {
+        let cli = Cli::parse_from(["na", "saved", "edit", "Weekly Focus", "--editor", "nano"]);
+        match cli.command {
+            Some(Commands::Saved(args)) => match args.command {
+                super::SavedCommands::Edit { title, editor } => {
+                    assert_eq!(title, "Weekly Focus");
+                    assert_eq!(editor.as_deref(), Some("nano"));
+                }
+                _ => panic!("expected saved edit"),
+            },
+            _ => panic!("expected saved"),
+        }
+    }
+
+    #[test]
+    fn plugin_management_subcommands_parse() {
+        let enable = Cli::parse_from(["na", "plugin", "enable", "fmt"]);
+        match enable.command {
+            Some(Commands::Plugin(args)) => match args.command {
+                super::PluginCommands::Enable { plugin } => assert_eq!(plugin, "fmt"),
+                _ => panic!("expected plugin enable"),
+            },
+            _ => panic!("expected plugin"),
+        }
+
+        let disable = Cli::parse_from(["na", "plugin", "disable", "fmt"]);
+        match disable.command {
+            Some(Commands::Plugin(args)) => match args.command {
+                super::PluginCommands::Disable { plugin } => assert_eq!(plugin, "fmt"),
+                _ => panic!("expected plugin disable"),
+            },
+            _ => panic!("expected plugin"),
+        }
+
+        let new_cmd = Cli::parse_from(["na", "plugin", "new", "fmt"]);
+        match new_cmd.command {
+            Some(Commands::Plugin(args)) => match args.command {
+                super::PluginCommands::New { plugin } => assert_eq!(plugin, "fmt"),
+                _ => panic!("expected plugin new"),
+            },
+            _ => panic!("expected plugin"),
         }
     }
 }

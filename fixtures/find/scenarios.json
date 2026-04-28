@@ -1,0 +1,19 @@
+{
+  "scenarios": [
+    {
+      "name": "simple tag search",
+      "fixture": "base.taskpaper",
+      "query": "@home"
+    },
+    {
+      "name": "taskpaper comparison search",
+      "fixture": "base.taskpaper",
+      "query": "@search(@priority > 3 and @context contains \"home\")"
+    },
+    {
+      "name": "exclude done search",
+      "fixture": "base.taskpaper",
+      "query": "@search(not @done)"
+    }
+  ]
+}

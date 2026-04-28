@@ -93,6 +93,25 @@ pub fn extract_actions(lines: &[String], path: &Path) -> Vec<Action> {
     out
 }
 
+/// Recompute `tags`, `tag_values`, and `done` from [`Action::text`] (TaskPaper action line body).
+pub fn refresh_action_tags(action: &mut Action) {
+    let tag_re = Regex::new(r"@([a-zA-Z0-9_\\-]+)(?:\((.*?)\))?").expect("valid regex");
+    let trimmed = format!("- {}", action.text);
+    let trimmed = trimmed.trim();
+    let mut tags = Vec::new();
+    let mut tag_values = HashMap::new();
+    for cap in tag_re.captures_iter(trimmed) {
+        let key = cap[1].to_string();
+        tags.push(format!("@{key}"));
+        if let Some(value) = cap.get(2) {
+            tag_values.insert(key.to_ascii_lowercase(), value.as_str().trim().to_string());
+        }
+    }
+    action.tags = tags;
+    action.tag_values = tag_values;
+    action.done = action.tags.iter().any(|t| t == "@done");
+}
+
 pub fn render_lines(lines: &[String]) -> String {
     if lines.is_empty() {
         String::new()
@@ -103,7 +122,8 @@ pub fn render_lines(lines: &[String]) -> String {
 
 #[cfg(test)]
 mod tests {
-    use super::{extract_actions, render_lines};
+    use super::{extract_actions, refresh_action_tags, render_lines};
+    use crate::models::action::Action;
     use std::path::Path;
 
     #[test]
@@ -172,6 +192,24 @@ mod tests {
             ]
         );
         assert!(actions[1].notes.is_empty());
+    }
+
+    #[test]
+    fn refresh_action_tags_updates_from_text() {
+        let mut a = Action {
+            text: "Task @priority(3)".to_string(),
+            line_index: 0,
+            project: None,
+            project_chain: vec![],
+            notes: vec![],
+            tags: vec![],
+            tag_values: std::collections::HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        refresh_action_tags(&mut a);
+        assert_eq!(a.tag_value("priority"), Some("3"));
     }
 
     #[test]

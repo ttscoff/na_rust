@@ -72,6 +72,7 @@ pub fn backup_path(path: &Path) -> PathBuf {
 #[cfg(test)]
 mod tests {
     use super::{backup_path, discover_taskpaper_files_with_options};
+    use crate::io::xdg::TEST_ENV_MUTEX;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::{Mutex, OnceLock};
@@ -103,6 +104,7 @@ mod tests {
 
     #[test]
     fn backup_path_uses_xdg_data_home_when_available() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
         let sample = Path::new("/tmp/example.taskpaper");
         let xdg = std::env::temp_dir().join("na_rust_xdg_data_home_test");
         std::env::set_var("XDG_DATA_HOME", &xdg);

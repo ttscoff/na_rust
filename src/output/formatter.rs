@@ -4,6 +4,7 @@ use crate::models::action::Action;
 pub struct OutputStyle {
     pub color: bool,
     pub na_tag: &'static str,
+    pub include_notes: bool,
 }
 
 pub fn format_action(action: &Action, style: OutputStyle, filename_prefix: Option<&str>) -> String {
@@ -20,9 +21,9 @@ pub fn format_action(action: &Action, style: OutputStyle, filename_prefix: Optio
     }
 
     let line_segment = if style.color {
-        paint(&format!(":{}", action.line_index + 1), AnsiColor::Line, false)
+        paint(&format!(":{}", action.line_index), AnsiColor::Line, false)
     } else {
-        format!(":{}", action.line_index + 1)
+        format!(":{}", action.line_index)
     };
     let parents_raw = if action.project_chain.is_empty() {
         String::new()
@@ -49,18 +50,23 @@ pub fn format_action(action: &Action, style: OutputStyle, filename_prefix: Optio
     let mut output = String::new();
     if !filename_segment.is_empty() {
         output.push_str(&filename_segment);
+        output.push(' ');
     }
-    output.push_str(&line_segment);
-    output.push(' ');
     if !parents_segment.is_empty() {
         output.push_str(&parents_segment);
         output.push(' ');
     }
-    if !parents_segment.is_empty() || !filename_segment.is_empty() {
-        output.push('|');
-        output.push(' ');
-    }
+    output.push_str(&line_segment);
+    output.push(' ');
+    output.push(' ');
     output.push_str(&text);
+    if style.include_notes && !action.notes.is_empty() {
+        for note in &action.notes {
+            output.push('\n');
+            output.push_str("    ");
+            output.push_str(note);
+        }
+    }
     output
 }
 
@@ -117,12 +123,27 @@ mod tests {
             OutputStyle {
                 color: false,
                 na_tag: "na",
+                include_notes: false,
             },
             Some("work/task.taskpaper"),
         );
         assert_eq!(
             out,
-            "work/task.taskpaper:5 [Work>ProjectA] | Draft report @priority(5)"
+            "work/task.taskpaper [Work>ProjectA] :4  Draft report @priority(5)"
         );
+    }
+
+    #[test]
+    fn formats_without_filename_prefix() {
+        let out = format_action(
+            &sample_action(),
+            OutputStyle {
+                color: false,
+                na_tag: "na",
+                include_notes: false,
+            },
+            None,
+        );
+        assert_eq!(out, "[Work>ProjectA] :4  Draft report @priority(5)");
     }
 }

@@ -24,6 +24,7 @@ struct TagComparison {
     op: CompareOp,
     value: String,
     negated: bool,
+    case_insensitive: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -63,7 +64,7 @@ impl Query {
                 negated_tags: vec!["@done".to_string()],
                 comparisons: Vec::new(),
                 project: None,
-                exclude_projects: vec!["Archive".to_string()],
+                exclude_projects: Vec::new(),
                 terms: Vec::new(),
             }],
             include_done: false,
@@ -178,6 +179,11 @@ impl Query {
     pub fn matches(&self, action: &Action) -> bool {
         self.clauses.iter().any(|clause| Self::matches_clause(clause, action))
     }
+
+    pub fn with_include_done(mut self, include_done: bool) -> Self {
+        self.include_done = include_done;
+        self
+    }
 }
 
 pub fn evaluate_query(files: &[TodoFile], query: &Query) -> Vec<Action> {
@@ -189,11 +195,22 @@ pub fn evaluate_query(files: &[TodoFile], query: &Query) -> Vec<Action> {
 }
 
 fn parse_project_predicate(input: &str) -> Option<String> {
-    let lower = input.to_lowercase();
+    let trimmed = input.trim();
+    let lower = trimmed.to_lowercase();
     if !lower.starts_with("project") {
         return None;
     }
-    let parts = input.splitn(2, '=').collect::<Vec<_>>();
+    // Supports both Ruby-like `project Inbox` and explicit `project = "Inbox"`.
+    if let Some(rest) = trimmed
+        .strip_prefix("project")
+        .or_else(|| trimmed.strip_prefix("Project"))
+    {
+        let rest = rest.trim();
+        if !rest.is_empty() && !rest.starts_with('=') {
+            return Some(strip_quotes(rest).to_string());
+        }
+    }
+    let parts = trimmed.splitn(2, '=').collect::<Vec<_>>();
     if parts.len() != 2 {
         return None;
     }
@@ -208,6 +225,7 @@ fn parse_tag_comparison(input: &str, negated: bool) -> Option<TagComparison> {
         "beginswith",
         "endswith",
         "contains",
+        "matches",
         "=~",
         ">=",
         "<=",
@@ -224,14 +242,20 @@ fn parse_tag_comparison(input: &str, negated: bool) -> Option<TagComparison> {
     }
     let (op_str, pos) = op?;
     let tag = no_at[..pos].trim().to_string();
-    let value = strip_quotes(no_at[pos + op_str.len()..].trim()).to_string();
+    let mut rest = no_at[pos + op_str.len()..].trim();
+    let mut case_insensitive = false;
+    if let Some(mod_rest) = rest.strip_prefix("[i]") {
+        case_insensitive = true;
+        rest = mod_rest.trim();
+    }
+    let value = strip_quotes(rest).to_string();
     let op = match op_str {
         "=" | "==" | "!=" => CompareOp::Eq,
         ">" => CompareOp::Gt,
         "<" => CompareOp::Lt,
         ">=" => CompareOp::Ge,
         "<=" => CompareOp::Le,
-        "=~" => CompareOp::Regex,
+        "=~" | "matches" => CompareOp::Regex,
         "contains" => CompareOp::Contains,
         "beginswith" => CompareOp::BeginsWith,
         "endswith" => CompareOp::EndsWith,
@@ -243,6 +267,7 @@ fn parse_tag_comparison(input: &str, negated: bool) -> Option<TagComparison> {
         op,
         value,
         negated: negated ^ forced_negate,
+        case_insensitive,
     })
 }
 
@@ -250,13 +275,38 @@ fn compare_tag_value(actual: Option<&str>, cmp: &TagComparison) -> bool {
     let Some(actual) = actual else { return false };
     match cmp.op {
         CompareOp::Eq => actual.eq_ignore_ascii_case(&cmp.value),
-        CompareOp::Contains => actual.to_lowercase().contains(&cmp.value.to_lowercase()),
-        CompareOp::BeginsWith => actual
-            .to_lowercase()
-            .starts_with(&cmp.value.to_lowercase()),
-        CompareOp::EndsWith => actual.to_lowercase().ends_with(&cmp.value.to_lowercase()),
+        CompareOp::Contains => {
+            if cmp.case_insensitive {
+                actual.to_lowercase().contains(&cmp.value.to_lowercase())
+            } else {
+                actual.contains(&cmp.value)
+            }
+        }
+        CompareOp::BeginsWith => {
+            if cmp.case_insensitive {
+                actual
+                    .to_lowercase()
+                    .starts_with(&cmp.value.to_lowercase())
+            } else {
+                actual.starts_with(&cmp.value)
+            }
+        }
+        CompareOp::EndsWith => {
+            if cmp.case_insensitive {
+                actual.to_lowercase().ends_with(&cmp.value.to_lowercase())
+            } else {
+                actual.ends_with(&cmp.value)
+            }
+        }
         CompareOp::Regex => {
-            regex::Regex::new(&cmp.value).map(|rx| rx.is_match(actual)).unwrap_or(false)
+            let pattern = if cmp.case_insensitive {
+                format!("(?i){}", cmp.value)
+            } else {
+                cmp.value.clone()
+            };
+            regex::Regex::new(&pattern)
+                .map(|rx| rx.is_match(actual))
+                .unwrap_or(false)
         }
         CompareOp::Gt | CompareOp::Lt | CompareOp::Ge | CompareOp::Le => {
             if let (Ok(a), Ok(b)) = (actual.parse::<f64>(), cmp.value.parse::<f64>()) {
@@ -389,7 +439,7 @@ mod tests {
     }
 
     #[test]
-    fn next_defaults_require_na_and_exclude_archive() {
+    fn next_defaults_require_na() {
         let q = Query::next_defaults("na");
         let a = Action {
             text: "Something @na".to_string(),
@@ -403,13 +453,7 @@ mod tests {
             due: None,
             source_file: "x.taskpaper".to_string(),
         };
-        let b = Action {
-            project: Some("Archive".to_string()),
-            project_chain: vec!["Archive".to_string()],
-            ..a.clone()
-        };
         assert!(q.matches(&a));
-        assert!(!q.matches(&b));
     }
 
     #[test]
@@ -578,5 +622,66 @@ mod tests {
             source_file: "x.taskpaper".to_string(),
         };
         assert!(!q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_supports_project_shortcut_without_equals() {
+        let q = Query::parse(r#"@search(project Errands and not @done)"#)
+            .expect("query should parse");
+        let a = Action {
+            text: "Buy milk".to_string(),
+            line_index: 0,
+            project: Some("Errands".to_string()),
+            project_chain: vec!["Errands".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@na".to_string()],
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_supports_matches_operator() {
+        let q = Query::parse(r#"@search(@context matches "^home-.*$")"#)
+            .expect("query should parse");
+        let mut tag_values = HashMap::new();
+        tag_values.insert("context".to_string(), "home-office".to_string());
+        let a = Action {
+            text: "Deep work".to_string(),
+            line_index: 0,
+            project: Some("Work".to_string()),
+            project_chain: vec!["Work".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@context".to_string()],
+            tag_values,
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_supports_case_modifier_i() {
+        let q = Query::parse(r#"@search(@context contains[i] "HOME")"#)
+            .expect("query should parse");
+        let mut tag_values = HashMap::new();
+        tag_values.insert("context".to_string(), "home-office".to_string());
+        let a = Action {
+            text: "Deep work".to_string(),
+            line_index: 0,
+            project: Some("Work".to_string()),
+            project_chain: vec!["Work".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@context".to_string()],
+            tag_values,
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&a));
     }
 }
