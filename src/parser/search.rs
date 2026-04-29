@@ -163,15 +163,12 @@ impl Query {
             action.project_chain.iter().map(String::as_str).collect()
         };
         let project_ok = clause.project.as_ref().is_none_or(|p| {
-            project_names
-                .iter()
-                .any(|name| name.eq_ignore_ascii_case(p) || name.to_lowercase().contains(&p.to_lowercase()))
+            project_predicate_matches_include(p.trim(), &project_names)
         });
-        let excluded_ok = clause.exclude_projects.iter().all(|p| {
-            project_names
-                .iter()
-                .all(|name| !name.eq_ignore_ascii_case(p) && !name.to_lowercase().contains(&p.to_lowercase()))
-        });
+        let excluded_ok = clause
+            .exclude_projects
+            .iter()
+            .all(|p| !project_predicate_matches_include(p.trim(), &project_names));
 
         terms_ok && tags_ok && negated_tags_ok && comparisons_ok && project_ok && excluded_ok
     }
@@ -339,6 +336,42 @@ fn strip_quotes(input: &str) -> &str {
     } else {
         input
     }
+}
+
+fn project_predicate_matches_include(pattern: &str, segments: &[&str]) -> bool {
+    if pattern.is_empty() {
+        return true;
+    }
+    if pattern.contains('*') {
+        let joined_gt = segments.join(">");
+        let joined_colon = segments.join(":");
+        glob_star_ordered_match(&joined_gt, pattern)
+            || (!joined_gt.is_empty() && glob_star_ordered_match(&joined_colon, pattern))
+            || segments.iter().any(|seg| glob_star_ordered_match(seg, pattern))
+    } else {
+        let pl = pattern.to_lowercase();
+        segments
+            .iter()
+            .any(|name| name.eq_ignore_ascii_case(pattern) || name.to_lowercase().contains(&pl))
+    }
+}
+
+/// `*` wildcard: non-empty fragments must appear left-to-right in `haystack` (case insensitive).
+fn glob_star_ordered_match(haystack: &str, pattern: &str) -> bool {
+    let hay = haystack.to_lowercase();
+    let pat_lc = pattern.to_lowercase();
+    let parts: Vec<&str> = pat_lc.split('*').filter(|s| !s.is_empty()).collect();
+    if parts.is_empty() {
+        return true;
+    }
+    let mut cursor = 0usize;
+    for part in parts {
+        match hay[cursor..].find(part) {
+            Some(ix) => cursor += ix + part.len(),
+            None => return false,
+        }
+    }
+    true
 }
 
 fn split_by_keyword<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
@@ -641,6 +674,29 @@ mod tests {
             source_file: "x.taskpaper".to_string(),
         };
         assert!(q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_matches_project_predicate_with_star_wildcard() {
+        let q = Query::parse(r#"@search(project Work*Trail and @home)"#).expect("query should parse");
+        let a = Action {
+            text: "Trail item @home".to_string(),
+            line_index: 0,
+            project: Some("ClientTrail".to_string()),
+            project_chain: vec!["Work".to_string(), "ClientTrail".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@home".to_string()],
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&a));
+        let mismatch = Action {
+            project_chain: vec!["Errands".to_string()],
+            ..a.clone()
+        };
+        assert!(!q.matches(&mismatch));
     }
 
     #[test]

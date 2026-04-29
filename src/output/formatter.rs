@@ -25,11 +25,15 @@ pub fn format_action(action: &Action, style: OutputStyle, filename_prefix: Optio
     } else {
         format!(":{}", action.line_index)
     };
-    let parents_raw = if action.project_chain.is_empty() {
-        String::new()
-    } else {
-        format!("[{}]", action.project_chain.join(">"))
-    };
+    // Leaf project only in brackets (matches Ruby `na` default display).
+    let leaf_project = action
+        .project_chain
+        .last()
+        .cloned()
+        .or_else(|| action.project.clone());
+    let parents_raw = leaf_project
+        .map(|p| format!("[{}]", p))
+        .unwrap_or_default();
     let parents_segment = if parents_raw.is_empty() {
         String::new()
     } else if style.color {
@@ -129,7 +133,7 @@ mod tests {
         );
         assert_eq!(
             out,
-            "work/task.taskpaper [Work>ProjectA] :4  Draft report @priority(5)"
+            "work/task.taskpaper [ProjectA] :4  Draft report @priority(5)"
         );
     }
 
@@ -144,6 +148,6 @@ mod tests {
             },
             None,
         );
-        assert_eq!(out, "[Work>ProjectA] :4  Draft report @priority(5)");
+        assert_eq!(out, "[ProjectA] :4  Draft report @priority(5)");
     }
 }

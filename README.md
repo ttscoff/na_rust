@@ -76,14 +76,15 @@ Use this list as the current parity status against `na_gem`.
 
 - [ ] Full `next` output rendering parity
   (core shape matches fixtures, but edge-formatting differences may remain)
-- [ ] Action text rendering parity
-  (Ruby strips some tags from default display)
+- [x] Project label in action output uses leaf project (matches Ruby brackets)
+- [ ] Action text rendering parity beyond `@na` strip
+  (Ruby may strip or format other tags differently in some modes)
 - [x] Archive filtering parity in current differential fixtures
 - [ ] Remaining Ruby option/alias compatibility gaps
   (global deprecated compatibility shims are still partial)
 - [ ] Full `@search(...)` parity
-  (wildcard behavior, item-path expressions, slice semantics,
-  nested precedence checks)
+  (`project` globs with `*` for chain/segment matching implemented;
+  item-path expressions, slice semantics, nested precedence checks still open)
 - [ ] Mutation semantics parity beyond current `update` baseline
   (interactive editor and legacy delegation paths still partial)
 - [x] Differential harness expansion to mutation commands

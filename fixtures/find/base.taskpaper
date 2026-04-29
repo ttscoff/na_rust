@@ -1,0 +1,11 @@
+Inbox:
+- Buy milk @home @priority(2)
+- Deep work @office @priority(5) @context(home-office)
+- Completed thing @done(2026-04-20 10:00)
+Errands:
+- Fix bike @home @priority(4)
+Archive:
+- Old archived @home
+Work:
+  ClientTrail:
+    - Trail item @home
