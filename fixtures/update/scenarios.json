@@ -1,0 +1,9 @@
+{
+  "scenarios": [
+    {
+      "name": "update add tag by query",
+      "fixture": "base.taskpaper",
+      "args": ["Ship feature", "--tag", "today", "--all"]
+    }
+  ]
+}

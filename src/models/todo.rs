@@ -16,7 +16,7 @@ pub struct TodoFile {
     lines: Vec<String>,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone)]
 pub struct UpdateMutation {
     pub add_tags: Vec<String>,
     pub remove_tags: Vec<String>,
@@ -27,6 +27,24 @@ pub struct UpdateMutation {
     pub restore: bool,
     pub note_lines: Vec<String>,
     pub overwrite_notes: bool,
+    pub append_to_project_end: bool,
+}
+
+impl Default for UpdateMutation {
+    fn default() -> Self {
+        Self {
+            add_tags: Vec::new(),
+            remove_tags: Vec::new(),
+            done: false,
+            replace_text: None,
+            move_to_project: None,
+            delete: false,
+            restore: false,
+            note_lines: Vec::new(),
+            overwrite_notes: false,
+            append_to_project_end: true,
+        }
+    }
 }
 
 impl TodoFile {
@@ -181,14 +199,14 @@ impl TodoFile {
             if mutation.done {
                 text = apply_done_timestamp_to_text(&text);
             }
+            for tag in &mutation.remove_tags {
+                remove_tag_from_line(&mut text, tag);
+            }
             for tag in &mutation.add_tags {
                 if !text.contains(tag) {
                     text.push(' ');
                     text.push_str(tag);
                 }
-            }
-            for tag in &mutation.remove_tags {
-                remove_tag_from_line(&mut text, tag);
             }
             let mut project = action.project.clone().unwrap_or_else(|| "Inbox".to_string());
             if mutation.restore
@@ -212,7 +230,7 @@ impl TodoFile {
             notes.retain(|n| !n.trim().is_empty());
 
             self.lines.drain(start..end);
-            self.add_action(Some(&project), &text, &notes, true);
+            self.add_action(Some(&project), &text, &notes, mutation.append_to_project_end);
             changed += 1;
         }
         if changed > 0 {
@@ -222,6 +240,15 @@ impl TodoFile {
     }
 
     pub fn archive_actions_by_lines(&mut self, line_indices: &HashSet<usize>) -> Result<usize> {
+        self.archive_actions_by_lines_with_options(line_indices, &[], false)
+    }
+
+    pub fn archive_actions_by_lines_with_options(
+        &mut self,
+        line_indices: &HashSet<usize>,
+        note_lines: &[String],
+        overwrite_notes: bool,
+    ) -> Result<usize> {
         let mut selected: Vec<Action> = self
             .actions()
             .into_iter()
@@ -237,7 +264,15 @@ impl TodoFile {
             if !action.done {
                 text = apply_done_timestamp_to_text(&text);
             }
-            archived_items.push((text, action.notes.clone()));
+            let mut notes = if overwrite_notes {
+                note_lines.to_vec()
+            } else {
+                let mut merged = action.notes.clone();
+                merged.extend(note_lines.to_vec());
+                merged
+            };
+            notes.retain(|n| !n.trim().is_empty());
+            archived_items.push((text, notes));
         }
 
         // Remove original action blocks bottom-up.

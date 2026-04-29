@@ -1,0 +1,9 @@
+{
+  "scenarios": [
+    {
+      "name": "archive done items",
+      "fixture": "base.taskpaper",
+      "args": ["--done", "--all"]
+    }
+  ]
+}

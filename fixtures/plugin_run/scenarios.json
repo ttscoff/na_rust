@@ -1,0 +1,12 @@
+{
+  "scenarios": [
+    {
+      "name": "plugin run echo json",
+      "fixture": "base.taskpaper",
+      "plugin": "echo",
+      "plugin_body": "#!/bin/sh\ncat\n",
+      "query": "@na",
+      "extra_args": []
+    }
+  ]
+}

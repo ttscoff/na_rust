@@ -8,7 +8,7 @@ use crate::models::action::Action;
 use crate::models::todo::{TodoFile, UpdateMutation};
 use crate::output::formatter::{format_action, OutputStyle};
 use crate::parser::search::{evaluate_query, Query};
-use crate::io::xdg::na_data_dir;
+use crate::io::xdg::{na_backup_dir, na_data_dir};
 use crate::plugins::format::{merge_plugin_stdout_into_actions, PluginDataFormat};
 use crate::plugins::registry::{PluginRegistry, PluginRunner};
 use anyhow::{Context, Result};
@@ -615,7 +615,7 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
         save_next_search(&next_args, title)?;
     }
     let files = load_find_todo_files(cli, args)?;
-    let mut matches = find_actions(&files, &args.query)?;
+    let mut matches = find_actions_with_options(&files, args)?;
     if !args.done {
         matches.retain(|a| !a.done);
     }
@@ -641,6 +641,13 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
             .into_iter()
             .filter(|a| !set.contains(&(a.source_file.clone(), a.line_index)))
             .collect();
+    }
+    if args.times {
+        output_find_time_summary(&matches, args.human);
+        return Ok(());
+    }
+    if let Some(merged) = run_find_plugin_merge(args, &matches)? {
+        matches = merged;
     }
 
     let style = OutputStyle {
@@ -673,6 +680,45 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
     Ok(())
 }
 
+fn run_find_plugin_merge(args: &FindArgs, actions: &[Action]) -> Result<Option<Vec<Action>>> {
+    let Some(name) = args.plugin.as_deref() else {
+        return Ok(None);
+    };
+    let dir = PluginRegistry::default_dir()?;
+    let registry = PluginRegistry::discover(&dir)?;
+    let plugin = registry.resolve_plugin(name)?;
+    let runner = PluginRunner::new(plugin.clone());
+    let input = args.input.as_deref().and_then(PluginDataFormat::parse);
+    let output = args.output.as_deref().and_then(PluginDataFormat::parse);
+    let divider = args.divider.as_deref();
+    let stdout = runner.run_with_formats(actions, input, output, divider)?;
+    let out_fmt = output.unwrap_or(plugin.output_format);
+    let merged = merge_plugin_stdout_into_actions(actions, &stdout, out_fmt, divider)?;
+    Ok(Some(merged))
+}
+
+fn output_find_time_summary(actions: &[Action], human: bool) {
+    let mut timed: Vec<(String, i64)> = Vec::new();
+    for action in actions {
+        if let Some(secs) = action_elapsed_seconds(action) {
+            timed.push((action.text.clone(), secs));
+        }
+    }
+    let total: i64 = timed.iter().map(|(_, secs)| *secs).sum();
+    for (text, secs) in &timed {
+        if human {
+            println!("{text} [{}]", human_duration(*secs));
+        } else {
+            println!("{text} [{secs}s]");
+        }
+    }
+    if human {
+        println!("Total: {}", human_duration(total));
+    } else {
+        println!("Total: {total}s");
+    }
+}
+
 fn load_find_todo_files(cli: &Cli, args: &FindArgs) -> Result<Vec<TodoFile>> {
     let depth = args.depth.unwrap_or(5);
     let mut files = if let Some(path) = &cli.global_file {
@@ -688,6 +734,51 @@ fn load_find_todo_files(cli: &Cli, args: &FindArgs) -> Result<Vec<TodoFile>> {
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
         .collect()
+}
+
+fn find_actions_with_options(files: &[TodoFile], args: &FindArgs) -> Result<Vec<Action>> {
+    let query = args.query.trim();
+    if query.starts_with("@search(") {
+        return find_actions(files, query);
+    }
+    let mut out: Vec<Action> = files.iter().flat_map(TodoFile::actions).collect();
+    let haystack = |a: &Action| {
+        if args.effective_search_notes() {
+            format!("{} {}", a.text, a.notes.join(" "))
+        } else {
+            a.text.clone()
+        }
+    };
+    if args.regex {
+        let rx = regex::Regex::new(query)?;
+        out.retain(|a| rx.is_match(&haystack(a)));
+        return Ok(out);
+    }
+    let query_lc = query.to_ascii_lowercase();
+    if args.exact {
+        out.retain(|a| haystack(a).to_ascii_lowercase().contains(&query_lc));
+        return Ok(out);
+    }
+    let tokens: Vec<String> = query
+        .split_whitespace()
+        .filter(|s| !s.trim().is_empty())
+        .map(|s| s.to_ascii_lowercase())
+        .collect();
+    if tokens.is_empty() {
+        return Ok(out);
+    }
+    if args.or_mode {
+        out.retain(|a| {
+            let h = haystack(a).to_ascii_lowercase();
+            tokens.iter().any(|t| h.contains(t))
+        });
+    } else {
+        out.retain(|a| {
+            let h = haystack(a).to_ascii_lowercase();
+            tokens.iter().all(|t| h.contains(t))
+        });
+    }
+    Ok(out)
 }
 
 fn run_tagged(cli: &Cli, args: &TaggedArgs) -> Result<()> {
@@ -1315,6 +1406,24 @@ fn remove_tag_value(text: &str, tag_name: &str) -> String {
 }
 
 fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
+    if args.archive {
+        let archive = ArchiveArgs {
+            query: args.query.clone(),
+            done: args.done,
+            file: args.file.clone(),
+            depth: args.depth,
+            tagged: args.tagged.clone(),
+            project: args.project.clone(),
+            in_todo: args.in_todo.clone(),
+            search: args.search.clone(),
+            regex: args.regex,
+            exact: args.exact,
+            all: args.all,
+            note: args.note.clone(),
+            overwrite_notes: args.overwrite_notes,
+        };
+        return run_archive(cli, &archive);
+    }
     let mut files = load_update_todo_files(cli, args)?;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let matches = collect_update_candidates(&files, args)?;
@@ -1325,12 +1434,36 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
     let mut add_tags = args.tag.clone();
     let mut remove_tags = args.untag.clone();
     let mut mark_done = args.done;
+    if let Some(priority) = parse_priority_value(args.priority.as_deref()) {
+        remove_tags.push("@priority".to_string());
+        add_tags.push(format!("@priority({priority})"));
+    }
+    if let Some(started) = args.started.as_deref() {
+        remove_tags.push("@started".to_string());
+        remove_tags.push("@start".to_string());
+        add_tags.push(format!("@started({started})"));
+    }
+    if let Some(done_at) = args.end.as_deref() {
+        remove_tags.push("@done".to_string());
+        add_tags.push(format!("@done({done_at})"));
+        mark_done = false;
+    }
+    if let Some(duration) = args.duration.as_deref() {
+        remove_tags.push("@duration".to_string());
+        add_tags.push(format!("@duration({duration})"));
+    }
 
     let needs_action_menu = args.query.is_none()
         && args.search.is_empty()
         && add_tags.is_empty()
         && remove_tags.is_empty()
-        && !mark_done;
+        && !mark_done
+        && args.replace.is_none()
+        && args.to.is_none()
+        && !args.delete
+        && !args.restore
+        && !args.edit
+        && args.note.is_empty();
 
     let selected = if needs_action_menu {
         let chosen = choose_actions_interactive(&matches, interactive)?;
@@ -1347,6 +1480,14 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
     } else {
         choose_actions_interactive(&matches, interactive)?
     };
+    let edit_seed_text = if args.edit {
+        if selected.len() != 1 {
+            anyhow::bail!("--edit currently supports selecting exactly one action");
+        }
+        Some(selected[0].text.clone())
+    } else {
+        None
+    };
 
     let mut by_file: HashMap<String, std::collections::HashSet<usize>> = HashMap::new();
     for action in selected {
@@ -1356,7 +1497,7 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
             .insert(action.line_index);
     }
 
-    let mutation = UpdateMutation {
+    let mut mutation = UpdateMutation {
         add_tags: add_tags.clone(),
         remove_tags: remove_tags.clone(),
         done: mark_done,
@@ -1366,7 +1507,19 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
         restore: args.restore,
         note_lines: args.note.clone(),
         overwrite_notes: args.overwrite_notes,
+        append_to_project_end: args
+            .at
+            .as_deref()
+            .map(|pos| add_position_is_append(Some(pos)))
+            .unwrap_or(true),
     };
+    if args.edit {
+        mutation.replace_text = Some(edit_action_text(
+            edit_seed_text
+                .as_deref()
+                .context("Missing selected action for --edit")?,
+        )?);
+    }
     let mut updated_count = 0usize;
     for todo in &mut files {
         let key = todo.path.display().to_string();
@@ -1376,6 +1529,27 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
     }
     println!("Updated {updated_count} action(s)");
     Ok(())
+}
+
+fn edit_action_text(initial: &str) -> Result<String> {
+    let mut path = std::env::temp_dir();
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_nanos();
+    path.push(format!("na_update_edit_{stamp}.tmp"));
+    fs::write(&path, format!("{initial}\n"))?;
+    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
+    let status = std::process::Command::new(editor).arg(&path).status()?;
+    if !status.success() {
+        let _ = fs::remove_file(&path);
+        anyhow::bail!("Editor exited with failure status");
+    }
+    let edited = fs::read_to_string(&path)?.trim().to_string();
+    let _ = fs::remove_file(&path);
+    if edited.is_empty() {
+        anyhow::bail!("Edited action text cannot be empty");
+    }
+    Ok(edited)
 }
 
 fn run_edit(cli: &Cli, args: &EditArgs) -> Result<()> {
@@ -1459,12 +1633,26 @@ fn run_move(cli: &Cli, args: &MoveArgs) -> Result<()> {
 fn run_tag(cli: &Cli, args: &TagArgs) -> Result<()> {
     let mut add = Vec::new();
     let mut remove = Vec::new();
-    for t in &args.tags {
-        if let Some(stripped) = t.strip_prefix('!').or_else(|| t.strip_prefix('-')) {
-            remove.push(if stripped.starts_with('@') { stripped.to_string() } else { format!("@{stripped}") });
-        } else {
-            add.push(if t.starts_with('@') { t.clone() } else { format!("@{t}") });
+    for raw in &args.tags {
+        for t in raw.split(',').map(str::trim).filter(|s| !s.is_empty()) {
+            if let Some(stripped) = t.strip_prefix('!').or_else(|| t.strip_prefix('-')) {
+                remove.push(if stripped.starts_with('@') {
+                    stripped.to_string()
+                } else {
+                    format!("@{stripped}")
+                });
+            } else {
+                add.push(if t.starts_with('@') {
+                    t.to_string()
+                } else {
+                    format!("@{t}")
+                });
+            }
         }
+    }
+    let mut tagged = args.tagged.clone();
+    if args.done {
+        tagged.push("@done".to_string());
     }
     let update = UpdateArgs {
         query: args.query.clone(),
@@ -1479,7 +1667,7 @@ fn run_tag(cli: &Cli, args: &TagArgs) -> Result<()> {
         replace: None,
         to: None,
         project: None,
-        tagged: args.tagged.clone(),
+        tagged,
         regex: args.regex,
         exact: args.exact,
         search_notes: args.search_notes,
@@ -1510,16 +1698,46 @@ fn run_open(cli: &Cli, args: &OpenArgs) -> Result<()> {
         paths.retain(|p| match_todo_path(p.to_string_lossy().as_ref(), &specs));
     }
     let Some(path) = paths.first() else { anyhow::bail!("No todo file found"); };
-    let editor = args
-        .editor
-        .clone()
-        .or_else(|| std::env::var("EDITOR").ok())
-        .unwrap_or_else(|| "vi".to_string());
-    let status = std::process::Command::new(editor).arg(path).status()?;
+    let (program, program_args) = open_command_for_target(path, args.editor.as_deref(), args.app.as_deref());
+    let status = std::process::Command::new(program)
+        .args(program_args)
+        .status()?;
     if !status.success() {
         anyhow::bail!("Open command failed");
     }
     Ok(())
+}
+
+fn open_command_for_target(
+    path: &Path,
+    editor_override: Option<&str>,
+    app_override: Option<&str>,
+) -> (String, Vec<String>) {
+    if let Some(app) = app_override {
+        #[cfg(target_os = "macos")]
+        {
+            return (
+                "open".to_string(),
+                vec![
+                    "-a".to_string(),
+                    app.to_string(),
+                    path.to_string_lossy().to_string(),
+                ],
+            );
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            return (
+                app.to_string(),
+                vec![path.to_string_lossy().to_string()],
+            );
+        }
+    }
+    let editor = editor_override
+        .map(ToString::to_string)
+        .or_else(|| std::env::var("EDITOR").ok())
+        .unwrap_or_else(|| "vi".to_string());
+    (editor, vec![path.to_string_lossy().to_string()])
 }
 
 fn run_projects(cli: &Cli, args: &ProjectsArgs) -> Result<()> {
@@ -1560,18 +1778,137 @@ fn run_todos(cli: &Cli, args: &TodosArgs) -> Result<()> {
     Ok(())
 }
 
-fn run_undo(_cli: &Cli, _args: &UndoArgs) -> Result<()> {
-    anyhow::bail!("undo command not yet implemented")
+fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<()> {
+    let mut backup_files: Vec<PathBuf> = Vec::new();
+    if let Some(path) = &cli.global_file {
+        let target = crate::io::fs::backup_path(path);
+        if target.exists() {
+            backup_files.push(target);
+        }
+    } else {
+        for entry in walkdir::WalkDir::new(na_backup_dir()).max_depth(10) {
+            let entry = entry?;
+            if entry.file_type().is_file() {
+                let p = entry.path();
+                if p.extension().and_then(|s| s.to_str()) == Some("bak") {
+                    backup_files.push(p.to_path_buf());
+                }
+            }
+        }
+    }
+    if backup_files.is_empty() {
+        anyhow::bail!("No backup files found");
+    }
+    backup_files.sort_by(|a, b| {
+        let ma = fs::metadata(a)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        let mb = fs::metadata(b)
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        mb.cmp(&ma).then_with(|| a.cmp(b))
+    });
+    let pick = if args.select {
+        let options: Vec<String> = backup_files
+            .iter()
+            .map(|p| p.to_string_lossy().to_string())
+            .collect();
+        let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+        let idx = choose_from_menu("Select backup to restore", &options, interactive)?;
+        backup_files
+            .get(idx)
+            .cloned()
+            .context("No backup candidate")?
+    } else {
+        backup_files.first().cloned().context("No backup candidate")?
+    };
+    let target = restore_target_from_backup_path(&pick);
+    if let Some(parent) = target.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    fs::copy(&pick, &target).with_context(|| format!("Failed restoring {:?} to {:?}", pick, target))?;
+    println!("Restored {}", target.display());
+    Ok(())
+}
+
+fn restore_target_from_backup_path(backup: &Path) -> PathBuf {
+    let rel = backup
+        .strip_prefix(na_backup_dir())
+        .unwrap_or(backup)
+        .to_path_buf();
+    let mut target = PathBuf::from("/");
+    target.push(rel);
+    let target_name = target
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("todo.taskpaper.bak")
+        .trim_end_matches(".bak")
+        .to_string();
+    target.set_file_name(target_name);
+    target
 }
 
 fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<()> {
-    let files = discover_taskpaper_files_with_options(&cli.extension, args.depth, args.hidden)?;
-    for f in files {
-        println!("{}", f.display());
+    let files = discover_taskpaper_files_with_options(&cli.extension, args.depth, args.hidden)?
+        .into_iter()
+        .map(|p| p.to_string_lossy().to_string())
+        .collect::<Vec<_>>();
+    let discovered: HashSet<String> = files.iter().cloned().collect();
+    let existing = read_scan_registry()?;
+    let mut to_add: Vec<String> = discovered.difference(&existing).cloned().collect();
+    let mut to_remove: Vec<String> = existing.difference(&discovered).cloned().collect();
+    to_add.sort();
+    to_remove.sort();
+
+    for f in &files {
+        println!("{f}");
     }
     if args.prune || args.dry_run {
-        let _ = (args.prune, args.dry_run);
+        for p in &to_add {
+            println!("+ {p}");
+        }
+        for p in &to_remove {
+            println!("- {p}");
+        }
+        println!("scan changes: +{} -{}", to_add.len(), to_remove.len());
     }
+    if !args.dry_run {
+        let next = if args.prune {
+            discovered
+        } else {
+            discovered.union(&existing).cloned().collect()
+        };
+        write_scan_registry(&next)?;
+    }
+    Ok(())
+}
+
+fn scan_registry_path() -> PathBuf {
+    na_data_dir().join("scan_paths.txt")
+}
+
+fn read_scan_registry() -> Result<HashSet<String>> {
+    let path = scan_registry_path();
+    if !path.exists() {
+        return Ok(HashSet::new());
+    }
+    let content = fs::read_to_string(path)?;
+    Ok(content
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty())
+        .map(ToString::to_string)
+        .collect())
+}
+
+fn write_scan_registry(paths: &HashSet<String>) -> Result<()> {
+    let path = scan_registry_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    let mut sorted: Vec<String> = paths.iter().cloned().collect();
+    sorted.sort();
+    fs::write(path, sorted.join("\n") + "\n")?;
     Ok(())
 }
 
@@ -1593,15 +1930,55 @@ fn run_prompt(args: &PromptArgs) -> Result<()> {
             Ok(())
         }
         PromptCommands::Install => {
-            println!("Prompt installation is not yet automated in Rust version.");
+            let profile = prompt_profile_path()?;
+            let line = r#"eval "$(na prompt show)""#;
+            let mut content = if profile.exists() {
+                fs::read_to_string(&profile)?
+            } else {
+                String::new()
+            };
+            if !content.lines().any(|l| l.trim() == line) {
+                if !content.is_empty() && !content.ends_with('\n') {
+                    content.push('\n');
+                }
+                content.push_str(line);
+                content.push('\n');
+                if let Some(parent) = profile.parent() {
+                    fs::create_dir_all(parent)?;
+                }
+                fs::write(&profile, content)?;
+                println!("Installed prompt hook in {}", profile.display());
+            } else {
+                println!("Prompt hook already present in {}", profile.display());
+            }
             Ok(())
         }
     }
 }
 
 fn run_changes() -> Result<()> {
-    println!("See CHANGELOG.md for recent changes.");
+    let changelog = PathBuf::from("CHANGELOG.md");
+    if !changelog.exists() {
+        anyhow::bail!("CHANGELOG.md not found");
+    }
+    print!("{}", fs::read_to_string(changelog)?);
     Ok(())
+}
+
+fn prompt_profile_path() -> Result<PathBuf> {
+    if let Ok(override_path) = std::env::var("NA_PROMPT_PROFILE") {
+        return Ok(PathBuf::from(override_path));
+    }
+    let home = std::env::var("HOME").context("HOME is not set")?;
+    let shell = std::env::var("SHELL").unwrap_or_default();
+    let profile = if shell.contains("zsh") {
+        ".zshrc"
+    } else if shell.contains("bash") {
+        ".bashrc"
+    } else {
+        ".profile"
+    };
+    Ok(PathBuf::from(home).join(profile))
 }
 
 fn run_archive(cli: &Cli, args: &ArchiveArgs) -> Result<()> {
@@ -1628,7 +2005,11 @@ fn run_archive(cli: &Cli, args: &ArchiveArgs) -> Result<()> {
     for todo in &mut files {
         let key = todo.path.display().to_string();
         if let Some(lines) = by_file.get(&key) {
-            moved_count += todo.archive_actions_by_lines(lines)?;
+            moved_count += todo.archive_actions_by_lines_with_options(
+                lines,
+                &args.note,
+                args.overwrite_notes,
+            )?;
         }
     }
     println!("Archived {moved_count} action(s)");
@@ -1720,11 +2101,9 @@ fn load_update_todo_files(cli: &Cli, args: &UpdateArgs) -> Result<Vec<TodoFile>>
 
 fn collect_update_candidates(files: &[TodoFile], args: &UpdateArgs) -> Result<Vec<Action>> {
     let mut out = if let Some(q) = args.query.as_deref() {
-        let query = Query::parse(q)?;
-        evaluate_query(files, &query)
+        update_seed_matches(files, q, args)?
     } else if !args.search.is_empty() {
-        let query = Query::parse(&args.search.join(" "))?;
-        evaluate_query(files, &query)
+        update_seed_matches(files, &args.search.join(" "), args)?
     } else {
         files.iter().flat_map(TodoFile::actions).collect()
     };
@@ -1740,6 +2119,46 @@ fn collect_update_candidates(files: &[TodoFile], args: &UpdateArgs) -> Result<Ve
             })
         });
     }
+    Ok(out)
+}
+
+fn update_seed_matches(files: &[TodoFile], pattern: &str, args: &UpdateArgs) -> Result<Vec<Action>> {
+    let query = pattern.trim();
+    if query.starts_with("@search(") && !args.regex && !args.exact {
+        let parsed = Query::parse(query)?;
+        return Ok(evaluate_query(files, &parsed));
+    }
+    let mut out: Vec<Action> = files.iter().flat_map(TodoFile::actions).collect();
+    let include_notes = args.search_notes && !args.no_search_notes;
+    let haystack = |a: &Action| {
+        if include_notes {
+            format!("{} {}", a.text, a.notes.join(" "))
+        } else {
+            a.text.clone()
+        }
+    };
+    if args.regex {
+        let rx = regex::Regex::new(query)?;
+        out.retain(|a| rx.is_match(&haystack(a)));
+        return Ok(out);
+    }
+    let needle = query.to_ascii_lowercase();
+    if args.exact {
+        out.retain(|a| haystack(a).to_ascii_lowercase().contains(&needle));
+        return Ok(out);
+    }
+    let parts: Vec<String> = needle
+        .split_whitespace()
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string)
+        .collect();
+    if parts.is_empty() {
+        return Ok(out);
+    }
+    out.retain(|a| {
+        let h = haystack(a).to_ascii_lowercase();
+        parts.iter().all(|p| h.contains(p))
+    });
     Ok(out)
 }
 
@@ -1953,10 +2372,15 @@ fn run_saved(command: &SavedCommands) -> Result<()> {
             Ok(())
         }
         SavedCommands::Select => {
-            for name in list_saved_searches()? {
-                println!("{name}");
+            let names = list_saved_searches()?;
+            if names.is_empty() {
+                anyhow::bail!("No saved searches found");
             }
-            Ok(())
+            let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+            let idx = choose_from_menu("Select saved search to run", &names, interactive)?;
+            run_saved(&SavedCommands::Run {
+                title: names[idx].clone(),
+            })
         }
     }
 }
@@ -2116,21 +2540,26 @@ mod tests {
     use super::{
         abbreviate_source_path, action_elapsed_seconds, add_position_is_append, build_add_text,
         choose_from_menu, completed_matches_date, completed_matches_pattern, find_actions,
+        find_actions_with_options,
         format_saved_search, implicit_next_args, is_cancel_selection, load_next_todo_files,
         list_saved_searches, load_update_todo_files, match_todo_path, next_actions, parse_multi_selection,
         parse_one_based_selection, parse_priority_value, parse_tag_input, parse_tag_datetime,
-        parse_todo_specs, resolve_item_path, run_archive, run_edit, run_plugin, run_saved,
-        run_update, save_next_search, saved_search_path, saved_search_slug, shell_quote_token,
-        strip_trailing_note,
+        open_command_for_target, parse_todo_specs, prompt_profile_path, read_scan_registry,
+        resolve_item_path, restore_target_from_backup_path, run_archive, run_edit, run_move,
+        run_plugin, run_prompt, run_saved, run_scan, run_tag,
+        run_undo, run_update, save_next_search, saved_search_path, saved_search_slug,
+        shell_quote_token, strip_trailing_note, write_scan_registry,
     };
     use crate::cli::{
-        AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, NextArgs, PluginCommands,
-        SavedCommands, UpdateArgs,
+        AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs,
+        NextArgs, PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs,
+        UndoArgs, UpdateArgs,
     };
     use crate::io::xdg::TEST_ENV_MUTEX;
     use crate::models::action::Action;
     use crate::models::todo::TodoFile;
     use clap::Parser;
+    use std::collections::HashSet;
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2172,6 +2601,35 @@ mod tests {
             json_times: false,
             only_times: false,
             save: None,
+        }
+    }
+
+    fn base_find_args(query: &str) -> FindArgs {
+        FindArgs {
+            query: query.to_string(),
+            regex: false,
+            exact: false,
+            depth: None,
+            in_todo: Vec::new(),
+            search_notes: true,
+            no_search_notes: false,
+            or_mode: false,
+            project: None,
+            tagged: Vec::new(),
+            done: false,
+            invert: false,
+            save: None,
+            notes: false,
+            no_notes: false,
+            nest: false,
+            no_file: false,
+            omnifocus: false,
+            times: false,
+            human: false,
+            plugin: None,
+            input: None,
+            output: None,
+            divider: None,
         }
     }
 
@@ -2318,6 +2776,132 @@ ProjectB:
 
         assert_eq!(out.len(), 1);
         assert!(out[0].text.contains("Done thing"));
+    }
+
+    #[test]
+    fn find_with_regex_matches_action_text() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Build API v2
+- Write docs
+"#,
+        );
+        let todo = TodoFile::load(&path).expect("fixture should load");
+        let mut args = base_find_args(r"API v\d");
+        args.regex = true;
+        let out = find_actions_with_options(&[todo], &args).expect("find should evaluate");
+        fs::remove_file(path).ok();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.contains("Build API"));
+    }
+
+    #[test]
+    fn find_with_or_mode_matches_any_term() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Build backend service
+- Plan roadmap
+"#,
+        );
+        let todo = TodoFile::load(&path).expect("fixture should load");
+        let mut args = base_find_args("backend docs");
+        args.or_mode = true;
+        let out = find_actions_with_options(&[todo], &args).expect("find should evaluate");
+        fs::remove_file(path).ok();
+        assert_eq!(out.len(), 1);
+        assert!(out[0].text.contains("Build backend"));
+    }
+
+    #[test]
+    fn find_search_notes_can_be_disabled() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Visible task
+    hidden needle in note
+"#,
+        );
+        let todo = TodoFile::load(&path).expect("fixture should load");
+        let mut args = base_find_args("needle");
+        args.no_search_notes = true;
+        let out = find_actions_with_options(&[todo], &args).expect("find should evaluate");
+        fs::remove_file(path).ok();
+        assert!(out.is_empty());
+    }
+
+    #[test]
+    fn undo_restores_latest_backup_for_global_file() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let path = write_named_fixture_taskpaper(
+            "undo_restore",
+            r#"Inbox:
+- Current content
+"#,
+        );
+        let backup = crate::io::fs::backup_path(&path);
+        if let Some(parent) = backup.parent() {
+            fs::create_dir_all(parent).expect("backup parent");
+        }
+        fs::write(
+            &backup,
+            r#"Inbox:
+- Restored content
+"#,
+        )
+        .expect("backup write");
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let args = UndoArgs { select: false };
+        run_undo(&cli, &args).expect("undo should restore backup");
+        let restored = fs::read_to_string(&path).expect("read restored file");
+        fs::remove_file(path).ok();
+        fs::remove_file(backup).ok();
+        assert!(restored.contains("Restored content"));
+    }
+
+    #[test]
+    fn undo_select_non_interactive_prefers_latest_backup() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let mut data_home = std::env::temp_dir();
+        data_home.push(format!(
+            "na_rust_undo_select_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        let backup_root = data_home.join("na").join("backup").join("tmp");
+        fs::create_dir_all(&backup_root).expect("backup root");
+        let older = backup_root.join("older.taskpaper.bak");
+        let newer = backup_root.join("newer.taskpaper.bak");
+        fs::write(&older, "Inbox:\n- older\n").expect("older write");
+        std::thread::sleep(std::time::Duration::from_millis(2));
+        fs::write(&newer, "Inbox:\n- newer\n").expect("newer write");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: None,
+            no_color: true,
+            command: None,
+        };
+        run_undo(&cli, &UndoArgs { select: true }).expect("undo select should succeed");
+        let restored = fs::read_to_string("/tmp/newer.taskpaper").expect("restored newer");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_file("/tmp/newer.taskpaper").ok();
+        fs::remove_dir_all(data_home).ok();
+        assert!(restored.contains("newer"), "{restored}");
+    }
+
+    #[test]
+    fn restore_target_from_backup_path_strips_backup_suffix() {
+        let backup = crate::io::xdg::na_backup_dir()
+            .join("tmp")
+            .join("demo.taskpaper.bak");
+        let target = restore_target_from_backup_path(&backup);
+        assert!(target.to_string_lossy().ends_with("/tmp/demo.taskpaper"));
     }
 
     #[test]
@@ -2888,6 +3472,280 @@ Inbox:
     }
 
     #[test]
+    fn run_move_at_start_places_action_first_in_target_project() {
+        let path = write_fixture_taskpaper(
+            r#"Source:
+- Move me @na
+Inbox:
+- Existing
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let args = MoveArgs {
+            query: Some("Move me".to_string()),
+            to: "Inbox".to_string(),
+            at: Some("start".to_string()),
+            from: None,
+            in_todo: Vec::new(),
+            file: None,
+            depth: 1,
+            search: Vec::new(),
+            search_notes: true,
+            tagged: Vec::new(),
+            regex: false,
+            exact: false,
+            all: true,
+        };
+        run_move(&cli, &args).expect("move should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("Inbox:\n- Move me @na\n- Existing"), "{updated}");
+    }
+
+    #[test]
+    fn run_move_at_end_places_action_last_in_target_project() {
+        let path = write_fixture_taskpaper(
+            r#"Source:
+- Move me @na
+Inbox:
+- Existing
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let args = MoveArgs {
+            query: Some("Move me".to_string()),
+            to: "Inbox".to_string(),
+            at: Some("end".to_string()),
+            from: None,
+            in_todo: Vec::new(),
+            file: None,
+            depth: 1,
+            search: Vec::new(),
+            search_notes: true,
+            tagged: Vec::new(),
+            regex: false,
+            exact: false,
+            all: true,
+        };
+        run_move(&cli, &args).expect("move should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("Inbox:\n- Existing\n- Move me @na"), "{updated}");
+    }
+
+    #[test]
+    fn run_update_regex_query_matches_and_updates() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Ship API v2
+- Write docs
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let mut args = base_update_args();
+        args.query = Some("API v\\d".to_string());
+        args.regex = true;
+        args.tag = vec!["@today".to_string()];
+        run_update(&cli, &args).expect("run_update should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("- Ship API v2 @today"), "{updated}");
+        assert!(updated.contains("- Write docs\n"), "{updated}");
+    }
+
+    #[test]
+    fn run_update_applies_timing_and_priority_tags() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Tune query @na
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let mut args = base_update_args();
+        args.query = Some("Tune query".to_string());
+        args.priority = Some("h".to_string());
+        args.started = Some("2026-04-20 09:00".to_string());
+        args.end = Some("2026-04-20 10:30".to_string());
+        args.duration = Some("90m".to_string());
+        run_update(&cli, &args).expect("run_update should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("@priority(5)"), "{updated}");
+        assert!(updated.contains("@started(2026-04-20 09:00)"), "{updated}");
+        assert!(updated.contains("@done(2026-04-20 10:30)"), "{updated}");
+        assert!(updated.contains("@duration(90m)"), "{updated}");
+    }
+
+    #[test]
+    fn run_update_archive_flag_moves_selected_action_to_archive() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Archive me
+- Keep me
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let mut args = base_update_args();
+        args.query = Some("Archive me".to_string());
+        args.archive = true;
+        args.all = true;
+        run_update(&cli, &args).expect("run_update archive should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("Archive:\n- Archive me @done("), "{updated}");
+        assert!(updated.contains("- Keep me"), "{updated}");
+    }
+
+    #[test]
+    fn open_command_uses_app_override_when_present() {
+        let path = PathBuf::from("/tmp/todo.taskpaper");
+        let (program, args) = open_command_for_target(&path, Some("nano"), Some("TextEdit"));
+        #[cfg(target_os = "macos")]
+        {
+            assert_eq!(program, "open");
+            assert_eq!(args, vec!["-a", "TextEdit", "/tmp/todo.taskpaper"]);
+        }
+        #[cfg(not(target_os = "macos"))]
+        {
+            assert_eq!(program, "TextEdit");
+            assert_eq!(args, vec!["/tmp/todo.taskpaper"]);
+        }
+    }
+
+    #[test]
+    fn scan_registry_round_trip_reads_written_paths() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let mut data_home = std::env::temp_dir();
+        data_home.push(format!(
+            "na_rust_scan_registry_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_home).expect("data home");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let mut expected = HashSet::new();
+        expected.insert("/tmp/a.taskpaper".to_string());
+        expected.insert("/tmp/b.taskpaper".to_string());
+        write_scan_registry(&expected).expect("registry write");
+        let read_back = read_scan_registry().expect("registry read");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_dir_all(data_home).ok();
+        assert_eq!(read_back, expected);
+    }
+
+    #[test]
+    fn run_scan_dry_run_does_not_mutate_registry_file() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let cwd = std::env::current_dir().expect("cwd");
+        let mut sandbox = std::env::temp_dir();
+        sandbox.push(format!(
+            "na_rust_scan_sandbox_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&sandbox).expect("sandbox");
+        fs::write(sandbox.join("todo.taskpaper"), "Inbox:\n- One\n").expect("fixture");
+        let mut data_home = std::env::temp_dir();
+        data_home.push(format!(
+            "na_rust_scan_data_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_home).expect("data home");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+        let mut seeded = HashSet::new();
+        seeded.insert("/tmp/stale.taskpaper".to_string());
+        write_scan_registry(&seeded).expect("seed registry");
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: None,
+            no_color: true,
+            command: None,
+        };
+        let args = ScanArgs {
+            depth: 3,
+            prune: true,
+            hidden: false,
+            dry_run: true,
+        };
+        std::env::set_current_dir(&sandbox).expect("enter sandbox");
+        run_scan(&cli, &args).expect("scan dry-run");
+        std::env::set_current_dir(cwd).expect("restore cwd");
+        let after = read_scan_registry().expect("read after");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_dir_all(sandbox).ok();
+        fs::remove_dir_all(data_home).ok();
+        assert_eq!(after, seeded);
+    }
+
+    #[test]
+    fn prompt_install_is_idempotent_for_profile_file() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let mut path = std::env::temp_dir();
+        path.push(format!(
+            "na_rust_prompt_profile_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        std::env::set_var("NA_PROMPT_PROFILE", &path);
+        let args = PromptArgs {
+            command: Some(PromptCommands::Install),
+        };
+        run_prompt(&args).expect("first install");
+        run_prompt(&args).expect("second install");
+        let content = fs::read_to_string(&path).expect("profile read");
+        std::env::remove_var("NA_PROMPT_PROFILE");
+        fs::remove_file(path).ok();
+        assert_eq!(
+            content
+                .lines()
+                .filter(|l| l.trim() == r#"eval "$(na prompt show)""#)
+                .count(),
+            1
+        );
+    }
+
+    #[test]
+    fn prompt_profile_path_honors_override_env() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        std::env::set_var("NA_PROMPT_PROFILE", "/tmp/na_prompt_profile_test");
+        let path = prompt_profile_path().expect("profile path");
+        std::env::remove_var("NA_PROMPT_PROFILE");
+        assert_eq!(path, PathBuf::from("/tmp/na_prompt_profile_test"));
+    }
+
+    #[test]
     fn load_update_todo_files_prefers_explicit_file_over_global_or_discovery() {
         let explicit = write_named_fixture_taskpaper("explicit", "Inbox:\n- Explicit\n");
         let global = write_named_fixture_taskpaper("global", "Inbox:\n- Global\n");
@@ -3086,6 +3944,103 @@ Inbox:
     }
 
     #[test]
+    fn run_saved_select_non_interactive_runs_first_sorted_entry() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let xdg = std::env::temp_dir().join(format!(
+            "na_rust_saved_select_fixture_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&xdg).expect("xdg fixture should create");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+        let output = xdg.join("selected.txt");
+        let alpha = saved_search_path("Alpha").expect("alpha path");
+        let zeta = saved_search_path("Zeta").expect("zeta path");
+        fs::create_dir_all(alpha.parent().expect("dir")).expect("search dir should create");
+        fs::write(&alpha, format!("echo alpha > {}", output.display())).expect("alpha write");
+        fs::write(&zeta, "echo zeta > /dev/null").expect("zeta write");
+
+        run_saved(&SavedCommands::Select).expect("select should run first sorted entry");
+
+        let ran = fs::read_to_string(&output).expect("select output should exist");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_dir_all(&xdg).ok();
+        assert_eq!(ran.trim(), "alpha");
+    }
+
+    #[test]
+    fn run_tag_supports_comma_and_removal_prefixes() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Tag me @old
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let args = TagArgs {
+            tags: vec!["today,!old,home".to_string()],
+            query: Some("Tag me".to_string()),
+            in_todo: Vec::new(),
+            done: false,
+            file: None,
+            depth: 1,
+            tagged: Vec::new(),
+            regex: false,
+            exact: false,
+            search: Vec::new(),
+            search_notes: true,
+            all: true,
+        };
+        run_tag(&cli, &args).expect("tag should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("@today"), "{updated}");
+        assert!(updated.contains("@home"), "{updated}");
+        assert!(!updated.contains("@old"), "{updated}");
+    }
+
+    #[test]
+    fn run_tag_done_filter_only_updates_done_actions() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Done one @done
+- Open one
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let args = TagArgs {
+            tags: vec!["reviewed".to_string()],
+            query: None,
+            in_todo: Vec::new(),
+            done: true,
+            file: None,
+            depth: 1,
+            tagged: Vec::new(),
+            regex: false,
+            exact: false,
+            search: Vec::new(),
+            search_notes: true,
+            all: true,
+        };
+        run_tag(&cli, &args).expect("tag should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+        assert!(updated.contains("- Done one @done @reviewed"), "{updated}");
+        assert!(updated.contains("- Open one\n"), "{updated}");
+    }
+
+    #[test]
     fn run_plugin_new_creates_stub_in_plugin_dir() {
         let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
         let xdg = std::env::temp_dir().join(format!(
@@ -3276,5 +4231,33 @@ Inbox:
 
         assert!(updated.contains("Archive:\n- Ship this @na @done("), "{updated}");
         assert!(updated.contains("- Keep this open"), "{updated}");
+    }
+
+    #[test]
+    fn run_archive_applies_note_and_overwrite_flags() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Ship this @na
+    old note
+"#,
+        );
+        let cli = Cli {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: Some(path.clone()),
+            no_color: true,
+            command: None,
+        };
+        let mut args = base_archive_args();
+        args.query = Some("Ship this".to_string());
+        args.note = vec!["new archive note".to_string()];
+        args.overwrite_notes = true;
+        args.all = true;
+        run_archive(&cli, &args).expect("archive should succeed");
+        let updated = fs::read_to_string(&path).expect("fixture should read");
+        fs::remove_file(path).ok();
+
+        assert!(updated.contains("\tnew archive note"), "{updated}");
+        assert!(!updated.contains("old note"), "{updated}");
     }
 }

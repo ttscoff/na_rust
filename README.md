@@ -1,6 +1,8 @@
 # na_rust
 
-## Differential Runners (`next`, `find`, `completed`)
+## Differential Runners
+
+Supported: `next`, `find`, `completed`, `update`, `archive`, `plugin run`.
 
 Run Ruby-vs-Rust parity checks for `next` fixtures:
 
@@ -9,7 +11,15 @@ cargo build
 python3 scripts/diff_next.py
 python3 scripts/diff_find.py
 python3 scripts/diff_completed.py
+python3 scripts/diff_update.py
+python3 scripts/diff_archive.py
+python3 scripts/diff_plugin_run.py
 ```
+
+Note: Ruby `na` can block in non-interactive mutation commands and may differ in
+plugin discovery paths on some systems. `diff_update.py`, `diff_archive.py`,
+and `diff_plugin_run.py` treat those cases as `SKIP` so the suite remains
+usable in CI.
 
 Optional flags:
 
@@ -60,7 +70,7 @@ Use this list as the current parity status against `na_gem`.
 - `init` / `create`: implemented
 - `prompt`: implemented (`show/install`)
 - `changes` / `changelog`: implemented
-- `undo`: placeholder behavior only (returns not-yet-implemented)
+- `undo`: implemented
 
 ### Known Gaps
 
@@ -76,8 +86,8 @@ Use this list as the current parity status against `na_gem`.
   nested precedence checks)
 - [ ] Mutation semantics parity beyond current `update` baseline
   (interactive editor and legacy delegation paths still partial)
-- [ ] Differential harness expansion to mutation commands
-  (`update`, `archive`, plugin flows)
+- [x] Differential harness expansion to mutation commands
+  (`update`, `archive`, and `plugin run` scripts present)
 
 ### Updating This Checklist
 
@@ -85,5 +95,6 @@ When parity changes:
 
 1. Add or update a fixture and differential scenario.
 2. Run `python3 scripts/diff_next.py`, `python3 scripts/diff_find.py`,
-   and `python3 scripts/diff_completed.py`.
+   `python3 scripts/diff_completed.py`, `python3 scripts/diff_update.py`,
+   `python3 scripts/diff_archive.py`, and `python3 scripts/diff_plugin_run.py`.
 3. Update checklist items based on actual pass/fail evidence.
