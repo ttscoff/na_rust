@@ -79,7 +79,10 @@ fn to_yaml(actions: &[Action]) -> String {
                 .map(|d| d.format("%Y-%m-%d").to_string())
                 .unwrap_or_default()
         ));
-        lines.push(format!("  source_file: {}", yaml_scalar(&action.source_file)));
+        lines.push(format!(
+            "  source_file: {}",
+            yaml_scalar(&action.source_file)
+        ));
     }
     if lines.is_empty() {
         String::new()
@@ -97,7 +100,8 @@ fn to_csv(actions: &[Action]) -> String {
         let project_chain = action.project_chain.join("|");
         let notes = action.notes.join("|");
         let tags = action.tags.join("|");
-        let tag_values = serde_json::to_string(&action.tag_values).unwrap_or_else(|_| "{}".to_string());
+        let tag_values =
+            serde_json::to_string(&action.tag_values).unwrap_or_else(|_| "{}".to_string());
         let due = action
             .due
             .map(|d| d.format("%Y-%m-%d").to_string())
@@ -114,7 +118,12 @@ fn to_csv(actions: &[Action]) -> String {
             due,
             action.source_file.clone(),
         ];
-        out.push_str(&row.into_iter().map(csv_escape).collect::<Vec<_>>().join(","));
+        out.push_str(
+            &row.into_iter()
+                .map(csv_escape)
+                .collect::<Vec<_>>()
+                .join(","),
+        );
         out.push('\n');
     }
     out
@@ -131,8 +140,14 @@ fn to_text_divider(actions: &[Action], block_sep: &str) -> String {
         let mut block = Vec::new();
         block.push(format!("text: {}", action.text));
         block.push(format!("line_index: {}", action.line_index));
-        block.push(format!("project: {}", action.project.clone().unwrap_or_default()));
-        block.push(format!("project_chain: {}", action.project_chain.join(" > ")));
+        block.push(format!(
+            "project: {}",
+            action.project.clone().unwrap_or_default()
+        ));
+        block.push(format!(
+            "project_chain: {}",
+            action.project_chain.join(" > ")
+        ));
         block.push(format!("tags: {}", action.tags.join(" ")));
         block.push(format!("notes: {}", action.notes.join(" | ")));
         block.push(format!("done: {}", action.done));
@@ -161,9 +176,8 @@ pub fn merge_plugin_stdout_into_actions(
     }
     match format {
         PluginDataFormat::Json => merge_after_json(base, trimmed),
-        PluginDataFormat::Yaml => merge_after_json(base, trimmed).or_else(|_| {
-            merge_after_text_divider(base, trimmed, divider.unwrap_or("---"))
-        }),
+        PluginDataFormat::Yaml => merge_after_json(base, trimmed)
+            .or_else(|_| merge_after_text_divider(base, trimmed, divider.unwrap_or("---"))),
         PluginDataFormat::Csv => merge_after_csv(base, trimmed),
         PluginDataFormat::TextDivider => {
             merge_after_text_divider(base, trimmed, divider.unwrap_or("---"))
@@ -175,10 +189,9 @@ fn merge_after_json(base: &[Action], trimmed: &str) -> Result<Vec<Action>> {
     if let Ok(full) = serde_json::from_str::<Vec<Action>>(trimmed) {
         let mut out = base.to_vec();
         for p in full {
-            if let Some(slot) = out
-                .iter_mut()
-                .find(|a| paths_match(&a.source_file, &p.source_file) && a.line_index == p.line_index)
-            {
+            if let Some(slot) = out.iter_mut().find(|a| {
+                paths_match(&a.source_file, &p.source_file) && a.line_index == p.line_index
+            }) {
                 *slot = p;
             }
         }
@@ -199,9 +212,9 @@ fn merge_json_patch(out: &mut Vec<Action>, v: &Value) -> Result<()> {
         .and_then(|x| x.as_str())
         .context("plugin JSON row needs source_file or file_path")?;
     let line_idx = resolve_line_index(v).context("plugin JSON row needs line_index or line")?;
-    let pos = out.iter_mut().find(|a| {
-        paths_match(&a.source_file, file) && a.line_index == line_idx
-    });
+    let pos = out
+        .iter_mut()
+        .find(|a| paths_match(&a.source_file, file) && a.line_index == line_idx);
     let Some(action) = pos else {
         return Ok(());
     };
@@ -321,10 +334,7 @@ fn apply_text_tags_from_strings(
 }
 
 /// Match Ruby: strip `@tag` / `@tag(...)` from text, then append tags from `{name, value}` objects.
-fn merge_text_with_plugin_tag_objects(
-    text: &str,
-    tag_objs: &[Value],
-) -> Result<String> {
+fn merge_text_with_plugin_tag_objects(text: &str, tag_objs: &[Value]) -> Result<String> {
     let stripped = strip_inline_taskpaper_tags(text);
     let extra = format_plugin_tag_objects(tag_objs)?;
     Ok(if extra.is_empty() {
@@ -389,14 +399,21 @@ fn merge_after_csv(base: &[Action], trimmed: &str) -> Result<Vec<Action>> {
     for row_line in lines {
         let fields = parse_csv_line(row_line);
         let map = csv_row_to_map(&idx, &fields);
-        let file = map.get("source_file").cloned().context("csv row source_file")?;
+        let file = map
+            .get("source_file")
+            .cloned()
+            .context("csv row source_file")?;
         let line_idx = if map.contains_key("line_index") {
             map.get("line_index")
                 .context("line_index")?
                 .parse::<usize>()
                 .context("line_index int")?
         } else if map.contains_key("line") {
-            let n: usize = map.get("line").context("line")?.parse().context("line int")?;
+            let n: usize = map
+                .get("line")
+                .context("line")?
+                .parse()
+                .context("line int")?;
             if n == 0 {
                 continue;
             }
@@ -404,9 +421,10 @@ fn merge_after_csv(base: &[Action], trimmed: &str) -> Result<Vec<Action>> {
         } else {
             continue;
         };
-        let Some(action) = out.iter_mut().find(|a| {
-            paths_match(&a.source_file, &file) && a.line_index == line_idx
-        }) else {
+        let Some(action) = out
+            .iter_mut()
+            .find(|a| paths_match(&a.source_file, &file) && a.line_index == line_idx)
+        else {
             continue;
         };
         let tags_col = map.get("tags").map(|s| s.as_str());
@@ -426,11 +444,7 @@ fn merge_after_csv(base: &[Action], trimmed: &str) -> Result<Vec<Action>> {
             };
             action.project = action.project_chain.last().cloned();
         } else if let Some(p) = map.get("project") {
-            action.project = if p.is_empty() {
-                None
-            } else {
-                Some(p.clone())
-            };
+            action.project = if p.is_empty() { None } else { Some(p.clone()) };
         }
         if let Some(d) = map.get("done") {
             action.done = d == "true";
@@ -493,7 +507,11 @@ fn parse_csv_line(line: &str) -> Vec<String> {
 
 fn merge_after_text_divider(base: &[Action], trimmed: &str, sep: &str) -> Result<Vec<Action>> {
     let sep_pat = format!("\n{sep}\n");
-    let blocks: Vec<&str> = trimmed.split(&sep_pat).map(str::trim).filter(|s| !s.is_empty()).collect();
+    let blocks: Vec<&str> = trimmed
+        .split(&sep_pat)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .collect();
     let mut out = base.to_vec();
     for block in blocks {
         let kv = parse_kv_block(block);
@@ -521,19 +539,12 @@ fn merge_after_text_divider(base: &[Action], trimmed: &str, sep: &str) -> Result
         else {
             continue;
         };
-        let tags_src = kv
-            .get("tags_json")
-            .map(|s| s.as_str())
-            .or_else(|| {
-                kv.get("tags")
-                    .filter(|s| s.trim_start().starts_with('['))
-                    .map(|s| s.as_str())
-            });
-        apply_text_tags_from_strings(
-            action,
-            kv.get("text").map(|s| s.as_str()),
-            tags_src,
-        )?;
+        let tags_src = kv.get("tags_json").map(|s| s.as_str()).or_else(|| {
+            kv.get("tags")
+                .filter(|s| s.trim_start().starts_with('['))
+                .map(|s| s.as_str())
+        });
+        apply_text_tags_from_strings(action, kv.get("text").map(|s| s.as_str()), tags_src)?;
         if let Some(n) = kv.get("notes") {
             action.notes = if n.is_empty() {
                 Vec::new()
@@ -549,11 +560,7 @@ fn merge_after_text_divider(base: &[Action], trimmed: &str, sep: &str) -> Result
             };
             action.project = action.project_chain.last().cloned();
         } else if let Some(p) = kv.get("project") {
-            action.project = if p.is_empty() {
-                None
-            } else {
-                Some(p.clone())
-            };
+            action.project = if p.is_empty() { None } else { Some(p.clone()) };
         }
         if let Some(d) = kv.get("done") {
             action.done = d == "true";
@@ -583,9 +590,7 @@ fn parse_kv_line(line: &str) -> Option<(String, String)> {
         return None;
     }
     const TAGS_JSON: &str = "tags_json:";
-    if line.len() >= TAGS_JSON.len()
-        && line[..TAGS_JSON.len()].eq_ignore_ascii_case(TAGS_JSON)
-    {
+    if line.len() >= TAGS_JSON.len() && line[..TAGS_JSON.len()].eq_ignore_ascii_case(TAGS_JSON) {
         let rest = line[TAGS_JSON.len()..].trim_start();
         return Some(("tags_json".to_string(), rest.to_string()));
     }
@@ -633,22 +638,24 @@ mod tests {
 
     #[test]
     fn serializes_actions_as_yaml() {
-        let out = serialize_actions(&[sample_action()], PluginDataFormat::Yaml).expect("yaml should serialize");
+        let out = serialize_actions(&[sample_action()], PluginDataFormat::Yaml)
+            .expect("yaml should serialize");
         assert!(out.contains("text: \"Deep work\""));
         assert!(out.contains("project: \"Work\""));
     }
 
     #[test]
     fn serializes_actions_as_csv() {
-        let out = serialize_actions(&[sample_action()], PluginDataFormat::Csv).expect("csv should serialize");
+        let out = serialize_actions(&[sample_action()], PluginDataFormat::Csv)
+            .expect("csv should serialize");
         assert!(out.contains("\"Deep work\""));
         assert!(out.contains("\"Work|Client\""));
     }
 
     #[test]
     fn serializes_actions_as_text_divider() {
-        let out =
-            serialize_actions(&[sample_action()], PluginDataFormat::TextDivider).expect("text should serialize");
+        let out = serialize_actions(&[sample_action()], PluginDataFormat::TextDivider)
+            .expect("text should serialize");
         assert!(out.contains("text: Deep work"));
         assert!(out.contains("project_chain: Work > Client"));
     }
@@ -656,7 +663,8 @@ mod tests {
     #[test]
     fn merge_json_patch_updates_text_and_tags() {
         let base = vec![sample_action()];
-        let stdout = r#"[{"source_file":"tasks.taskpaper","line_index":3,"text":"Updated @na @home"}]"#;
+        let stdout =
+            r#"[{"source_file":"tasks.taskpaper","line_index":3,"text":"Updated @na @home"}]"#;
         let merged = merge_plugin_stdout_into_actions(&base, stdout, PluginDataFormat::Json, None)
             .expect("merge");
         assert_eq!(merged[0].text, "Updated @na @home");
@@ -697,7 +705,11 @@ mod tests {
         let merged = merge_plugin_stdout_into_actions(&base, stdout, PluginDataFormat::Csv, None)
             .expect("merge");
         assert!(merged[0].text.contains("Plain body"), "{}", merged[0].text);
-        assert!(merged[0].text.contains("@priority(9)"), "{}", merged[0].text);
+        assert!(
+            merged[0].text.contains("@priority(9)"),
+            "{}",
+            merged[0].text
+        );
         assert!(!merged[0].text.contains("@old"), "{}", merged[0].text);
     }
 
@@ -711,15 +723,15 @@ mod tests {
             r#"tags_json: [{"name":"priority","value":"9"}]"#,
             "\n",
         );
-        let merged = merge_plugin_stdout_into_actions(
-            &base,
-            stdout,
-            PluginDataFormat::TextDivider,
-            None,
-        )
-        .expect("merge");
+        let merged =
+            merge_plugin_stdout_into_actions(&base, stdout, PluginDataFormat::TextDivider, None)
+                .expect("merge");
         assert!(merged[0].text.contains("Plain body"), "{}", merged[0].text);
-        assert!(merged[0].text.contains("@priority(9)"), "{}", merged[0].text);
+        assert!(
+            merged[0].text.contains("@priority(9)"),
+            "{}",
+            merged[0].text
+        );
         assert!(!merged[0].text.contains("@old"), "{}", merged[0].text);
     }
 
@@ -733,13 +745,13 @@ mod tests {
             r#"tags: [{"name":"priority","value":"9"}]"#,
             "\n",
         );
-        let merged = merge_plugin_stdout_into_actions(
-            &base,
-            stdout,
-            PluginDataFormat::TextDivider,
-            None,
-        )
-        .expect("merge");
-        assert!(merged[0].text.contains("@priority(9)"), "{}", merged[0].text);
+        let merged =
+            merge_plugin_stdout_into_actions(&base, stdout, PluginDataFormat::TextDivider, None)
+                .expect("merge");
+        assert!(
+            merged[0].text.contains("@priority(9)"),
+            "{}",
+            merged[0].text
+        );
     }
 }

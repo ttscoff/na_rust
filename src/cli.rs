@@ -91,7 +91,12 @@ pub struct NextArgs {
     pub filter: Option<String>,
 
     /// Keep only one action per project.
-    #[arg(short = 'a', long = "first-available", visible_alias = "available", default_value_t = false)]
+    #[arg(
+        short = 'a',
+        long = "first-available",
+        visible_alias = "available",
+        default_value_t = false
+    )]
     pub first_available: bool,
 
     /// Display matches from a specific TaskPaper file.
@@ -232,7 +237,7 @@ impl NextArgs {
 #[derive(Debug, Clone, Args)]
 pub struct FindArgs {
     /// Search query terms or @search(...) expression.
-    #[arg(value_name = "QUERY")]
+    #[arg(value_name = "QUERY", default_value = "")]
     pub query: String,
 
     /// Interpret search pattern as regular expression.
@@ -356,10 +361,11 @@ impl FindArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct TaggedArgs {
-    #[arg(value_name = "TAG", num_args = 0..)]
-    pub tags: Vec<String>,
     #[command(flatten)]
     pub find: FindArgs,
+    /// Tag filters (combined into the find query). Place **after** find flags, e.g. `na tagged --json-times @na`.
+    #[arg(value_name = "TAG", num_args = 0.., last = true)]
+    pub tags: Vec<String>,
 }
 
 #[derive(Debug, Args)]
@@ -436,7 +442,12 @@ pub struct UpdateArgs {
     pub untag: Vec<String>,
 
     /// Mark action as done.
-    #[arg(short = 'f', long = "finish", visible_alias = "done", default_value_t = false)]
+    #[arg(
+        short = 'f',
+        long = "finish",
+        visible_alias = "done",
+        default_value_t = false
+    )]
     pub done: bool,
 
     /// Restrict updates to a specific file path.
@@ -524,7 +535,12 @@ pub struct UpdateArgs {
     pub note: Vec<String>,
 
     /// Replace existing notes instead of appending.
-    #[arg(short = 'o', long = "overwrite-notes", visible_alias = "overwrite", default_value_t = false)]
+    #[arg(
+        short = 'o',
+        long = "overwrite-notes",
+        visible_alias = "overwrite",
+        default_value_t = false
+    )]
     pub overwrite_notes: bool,
 
     /// Set started timestamp token.
@@ -890,7 +906,12 @@ pub struct TodosArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct UndoArgs {
-    #[arg(short = 's', long = "select", visible_alias = "choose", default_value_t = false)]
+    #[arg(
+        short = 's',
+        long = "select",
+        visible_alias = "choose",
+        default_value_t = false
+    )]
     pub select: bool,
 }
 
@@ -1098,16 +1119,7 @@ mod tests {
 
     #[test]
     fn update_short_r_f_o_parse() {
-        let cli = Cli::parse_from([
-            "na",
-            "update",
-            "-r",
-            "@na",
-            "-f",
-            "-o",
-            "--all",
-            "needle",
-        ]);
+        let cli = Cli::parse_from(["na", "update", "-r", "@na", "-f", "-o", "--all", "needle"]);
         match cli.command {
             Some(Commands::Update(args)) => {
                 assert_eq!(args.untag, vec!["@na".to_string()]);
@@ -1147,13 +1159,7 @@ mod tests {
     #[test]
     fn update_editor_flag_parses() {
         let cli = Cli::parse_from([
-            "na",
-            "update",
-            "--editor",
-            "nano",
-            "--edit",
-            "--all",
-            "needle",
+            "na", "update", "--editor", "nano", "--edit", "--all", "needle",
         ]);
         match cli.command {
             Some(Commands::Update(args)) => {

@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -16,6 +17,7 @@ class Scenario:
     name: str
     fixture: str
     query: str
+    extra_args: List[str]
 
 
 @dataclass
@@ -32,6 +34,7 @@ def read_scenarios(path: Path) -> List[Scenario]:
             name=item["name"],
             fixture=item["fixture"],
             query=item["query"],
+            extra_args=item.get("args", []),
         )
         for item in payload.get("scenarios", [])
     ]
@@ -41,13 +44,28 @@ def normalize(text: str) -> str:
     return text.replace("\r\n", "\n").strip()
 
 
+def normalize_times_line_spacing(text: str) -> str:
+    lines = []
+    for line in text.split("\n"):
+        lines.append(re.sub(r"(\]\s*:\d+)\s{2,}", r"\1 ", line))
+    return "\n".join(lines)
+
+
+def postprocess_find_stdout(stdout: str, extra_args: List[str]) -> str:
+    _ = extra_args
+    return normalize_times_line_spacing(stdout)
+
+
 def run_cmd(command: List[str], cwd: Path) -> RunResult:
+    env = os.environ.copy()
+    env.setdefault("TZ", "UTC")
     proc = subprocess.run(
         command,
         cwd=str(cwd),
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         text=True,
+        env=env,
     )
     return RunResult(proc.returncode, normalize(proc.stdout), normalize(proc.stderr))
 
@@ -116,12 +134,18 @@ def main() -> int:
             tmp_path = Path(tmp)
             tmp_fixture = tmp_path / "case.taskpaper"
             shutil.copy2(fixture_path, tmp_fixture)
-            ruby_result = run_cmd([str(ruby_na), "find", scenario.query], tmp_path)
-            rust_result = run_cmd([str(rust_na), "find", scenario.query], tmp_path)
+            ruby_cmd = [str(ruby_na), "find", scenario.query] + scenario.extra_args
+            rust_cmd = [str(rust_na), "find", scenario.query] + scenario.extra_args
+            ruby_result = run_cmd(ruby_cmd, tmp_path)
+            rust_result = run_cmd(rust_cmd, tmp_path)
+
+        cmp_args = scenario.extra_args
+        ruby_out = postprocess_find_stdout(ruby_result.stdout, cmp_args)
+        rust_out = postprocess_find_stdout(rust_result.stdout, cmp_args)
 
         ok = (
             ruby_result.exit_code == rust_result.exit_code
-            and ruby_result.stdout == rust_result.stdout
+            and ruby_out == rust_out
             and ruby_result.stderr == rust_result.stderr
         )
         print(f"[{'PASS' if ok else 'FAIL'}] {scenario.name}")

@@ -2,7 +2,7 @@
 
 ## Differential Runners
 
-Supported: `next`, `find`, `completed`, `update`, `archive`, `plugin run`.
+Supported: `next`, `find`, `tagged`, `completed`, `update`, `archive`, `plugin run`.
 
 Run Ruby-vs-Rust parity checks for `next` fixtures:
 
@@ -10,11 +10,20 @@ Run Ruby-vs-Rust parity checks for `next` fixtures:
 cargo build
 python3 scripts/diff_next.py
 python3 scripts/diff_find.py
+python3 scripts/diff_tagged.py
 python3 scripts/diff_completed.py
 python3 scripts/diff_update.py
 python3 scripts/diff_archive.py
 python3 scripts/diff_plugin_run.py
 ```
+
+Time-related scenarios (`--times`, `--json-times`, `--only-times`, `--only-timed`) use
+fixed `@started` / `@done` fixtures and set **`TZ=UTC`** in the harness so ISO timestamps
+and durations match Ruby deterministically.
+
+**`--nest` / `--omnifocus`** scenarios normalize each **`path:line:`** banner to
+**`FIXTURE:line:`** after resolving both sides’ paths so Ruby’s absolute / `~`-prefixed
+headers compare equal to Rust.
 
 Note: Ruby `na` can block in non-interactive mutation commands and may differ in
 plugin discovery paths on some systems. `diff_update.py`, `diff_archive.py`,
@@ -105,12 +114,12 @@ Rust loads and merges YAML from (in order, later overrides earlier):
 
 Placeholders match Ruby’s token set: `%filename` / `%filename%`, `%line` / `%line%`, `%parents` / `%parent` / `%parents%`, **`%project`** (leaf name only; theme key `project`), `%action`, `%note`. Ruby often **abuts** tokens without spaces (e.g. `%filename%line` — one `%` between tokens); that form is supported. Rust may also use explicit `%filename%%line%` between segments.
 
-**Nested output (`--nest` / `--omnifocus`):** grouping and indentation match the Ruby-style shapes (per-file header, tabbed `- [a/b/c]` lines, or OmniFocus-style project trees), but nested mode is **plain text** — **`theme.yaml` colors and templates do not apply** there today. When notes exist but are omitted, action lines still get a trailing `*` (same idea as flat output).
+**Nested output (`--nest` / `--omnifocus`):** Matches Ruby’s **`path:line:`** banners (one per action), bracket coloring, tag highlighting in bodies (`highlight_tags`-style), OmniFocus-style trees (including `@tags(...)` suffixes and tab alignment). Flat **`templates.*`** layouts do not apply to nested stdout (same as using full action text in the gem). **`$COLUMNS`** word-wrap applies to nested bodies when stdout is a TTY and **`COLUMNS`** is set. Duration decoration on nested lines follows the gem’s pattern when combined with **`--times`** / **`--human`** / **`--only-times`** (skip inline decoration; **`--json-times`** still emits JSON).
 
 ### Known Gaps
 
-- [ ] **`next` / `find` / `completed` nested mode (`--nest` / `--omnifocus`)**
-  (structure and `*` note markers align with Ruby-style output; **no `theme.yaml` colors/templates**, **no `$COLUMNS` word-wrap** on nested lines; minor file-path header differences vs Ruby possible. Combined with **`--times` / `--human` / `--only-times`** Ruby does not decorate nested lines — Rust mirrors that; **`--json-times` still emits JSON** when nested.)
+- [ ] **`next` / `find` / `completed` nested polish**
+  (core shapes and **`scripts/diff_next.py`** scenarios for **`--nest`** / **`--omnifocus`** match Ruby; remaining gaps are mostly **theme.duration-style** brackets on timed nested lines if we choose parity there, and any edge cases not covered by fixtures.)
 - [x] Project label in action output uses leaf project (matches Ruby brackets)
 - [ ] Action text rendering parity beyond `@na` strip
   (Ruby may strip or format other tags differently in some modes)

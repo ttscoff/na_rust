@@ -4,6 +4,7 @@ use crate::models::action::Action;
 use crate::parser::parse_tag_datetime;
 use chrono::{DateTime, Utc};
 use serde::Serialize;
+use std::cmp::Ordering;
 use std::collections::HashMap;
 
 /// Elapsed interval from `@started`/`@start` through `@done` (non-negative seconds only).
@@ -60,7 +61,11 @@ pub(crate) fn format_ruby_duration(secs: i64, human: bool) -> String {
 }
 
 /// Add [`secs`] to every non-time tag on [`action`] (Ruby `totals_by_tag` semantics).
-pub(crate) fn accumulate_timing_totals_by_tag(action: &Action, secs: i64, out: &mut HashMap<String, i64>) {
+pub(crate) fn accumulate_timing_totals_by_tag(
+    action: &Action,
+    secs: i64,
+    out: &mut HashMap<String, i64>,
+) {
     for raw in action.tags.iter().map(|t| t.as_str()) {
         let tag = raw.trim_start_matches('@');
         let key = tag.to_ascii_lowercase();
@@ -118,11 +123,12 @@ pub(crate) fn serialize_json_times(
             });
         }
     }
-    let mut tag_rows: Vec<(String, i64)> = totals_by_tag
-        .iter()
-        .map(|(k, v)| (k.clone(), *v))
-        .collect();
-    tag_rows.sort_by(|a, b| b.1.cmp(&a.1));
+    let mut tag_rows: Vec<(String, i64)> =
+        totals_by_tag.iter().map(|(k, v)| (k.clone(), *v)).collect();
+    tag_rows.sort_by(|a, b| match b.1.cmp(&a.1) {
+        Ordering::Equal => b.0.cmp(&a.0),
+        o => o,
+    });
     let tags: Vec<JsonTagRow> = tag_rows
         .into_iter()
         .map(|(k, d)| JsonTagRow {
@@ -143,18 +149,26 @@ pub(crate) fn serialize_json_times(
 }
 
 /// Footer: either a single "Total time" line or a Markdown table per tag + total row.
-pub(crate) fn render_duration_footer(stdout: &mut impl std::fmt::Write, total_seconds: i64, human: bool, totals_by_tag: &HashMap<String, i64>) -> std::fmt::Result {
+pub(crate) fn render_duration_footer(
+    stdout: &mut impl std::fmt::Write,
+    total_seconds: i64,
+    human: bool,
+    totals_by_tag: &HashMap<String, i64>,
+) -> std::fmt::Result {
     if total_seconds <= 0 {
         return Ok(());
     }
     let total_disp = format_ruby_duration(total_seconds, human);
-    writeln!(stdout)?;
     if totals_by_tag.is_empty() {
+        writeln!(stdout)?;
         writeln!(stdout, "Total time: [{total_disp}]")?;
         return Ok(());
     }
     let mut tag_pairs: Vec<(&String, &i64)> = totals_by_tag.iter().collect();
-    tag_pairs.sort_by(|a, b| b.1.cmp(a.1));
+    tag_pairs.sort_by(|a, b| match b.1.cmp(a.1) {
+        Ordering::Equal => b.0.cmp(a.0),
+        o => o,
+    });
     let rows: Vec<(String, String)> = tag_pairs
         .into_iter()
         .map(|(tag, secs)| (format!("@{tag}"), format_ruby_duration(*secs, human)))
@@ -222,10 +236,7 @@ mod tests {
 
     #[test]
     fn ninety_minutes_compact_format() {
-        assert_eq!(
-            format_ruby_duration(90 * 60, false),
-            "00:01:30:00"
-        );
+        assert_eq!(format_ruby_duration(90 * 60, false), "00:01:30:00");
     }
 
     #[test]

@@ -1,9 +1,10 @@
 use crate::cli::{
     AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs, NextArgs,
-    OpenArgs, PluginCommands, ProjectsArgs, PromptCommands, PromptArgs, SavedCommands, ScanArgs,
+    OpenArgs, PluginCommands, ProjectsArgs, PromptArgs, PromptCommands, SavedCommands, ScanArgs,
     TagArgs, TaggedArgs, TodosArgs, UndoArgs, UpdateArgs,
 };
 use crate::io::fs::{discover_taskpaper_files, discover_taskpaper_files_with_options};
+use crate::io::xdg::{na_backup_dir, na_data_dir};
 use crate::models::action::Action;
 use crate::models::todo::{TodoFile, UpdateMutation};
 use crate::output::duration::{
@@ -11,14 +12,13 @@ use crate::output::duration::{
     render_duration_footer, serialize_json_times,
 };
 use crate::output::formatter::{
-    color_action_body, format_action, nested_bracketed_chain, nested_file_title, paint_themed,
-    visual_width_tabs8, wrap_words, OutputStyle,
+    color_action_body, format_action, nested_bracketed_chain, paint_themed, visual_width_tabs8,
+    wrap_words, OutputStyle,
 };
 use crate::output::theme::Theme;
 use crate::parser::item_path::resolve_item_path;
 use crate::parser::search::{evaluate_query, Query};
 use crate::parser::{expand_date_tags_in_line, parse_tag_datetime};
-use crate::io::xdg::{na_backup_dir, na_data_dir};
 use crate::plugins::format::{merge_plugin_stdout_into_actions, PluginDataFormat};
 use crate::plugins::registry::{PluginRegistry, PluginRunner};
 use anyhow::{Context, Result};
@@ -26,8 +26,8 @@ use chrono::{DateTime, Utc};
 use inquire::{InquireError, MultiSelect, Select, Text};
 use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
-use std::io::Read;
 use std::io::IsTerminal;
+use std::io::Read;
 use std::path::{Path, PathBuf};
 use std::sync::OnceLock;
 
@@ -136,7 +136,7 @@ fn run_next(cli: &Cli, args: &NextArgs) -> Result<()> {
     if let Some(merged) = run_next_plugin_merge(args, &display_actions)? {
         display_actions = merged;
     }
-    let wants_time_block = args.times || args.json_times || args.only_times;
+    let wants_time_block = args.times || args.json_times || args.only_times || args.only_timed;
     if wants_time_block {
         if args.json_times || !args.nest_for_display() {
             return render_next_time_block(cli, args, &display_actions);
@@ -160,13 +160,14 @@ fn run_next(cli: &Cli, args: &NextArgs) -> Result<()> {
     };
 
     if args.nest_for_display() {
-        print_next_nested(args, style, &file_labels, &display_actions, &theme);
+        print_next_nested(args, style, &display_actions, &theme);
     } else {
         for action in &display_actions {
-            let file_prefix = file_labels
-                .get(&action.source_file)
-                .map(String::as_str);
-            println!("{}", format_action(action, style, file_prefix, &theme, args.no_file));
+            let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
+            println!(
+                "{}",
+                format_action(action, style, file_prefix, &theme, args.no_file)
+            );
         }
     }
 
@@ -181,7 +182,8 @@ fn save_next_search(args: &NextArgs, title: &str) -> Result<()> {
     let dir = saved_searches_dir();
     fs::create_dir_all(&dir).with_context(|| format!("Failed to create {:?}", dir))?;
     let path = dir.join(format!("{slug}.txt"));
-    fs::write(&path, format_saved_search(args)).with_context(|| format!("Failed to write {:?}", path))?;
+    fs::write(&path, format_saved_search(args))
+        .with_context(|| format!("Failed to write {:?}", path))?;
     eprintln!("Saved search to {}", path.display());
     Ok(())
 }
@@ -291,7 +293,25 @@ fn shell_quote_token(token: &str) -> String {
     }
     let needs_quotes = token.chars().any(|c| {
         c.is_whitespace()
-            || matches!(c, '\'' | '"' | '\\' | '$' | '`' | '!' | '&' | '|' | ';' | '<' | '>' | '(' | ')' | '[' | ']' | '{' | '}')
+            || matches!(
+                c,
+                '\'' | '"'
+                    | '\\'
+                    | '$'
+                    | '`'
+                    | '!'
+                    | '&'
+                    | '|'
+                    | ';'
+                    | '<'
+                    | '>'
+                    | '('
+                    | ')'
+                    | '['
+                    | ']'
+                    | '{'
+                    | '}'
+            )
     });
     if !needs_quotes {
         return token.to_string();
@@ -368,6 +388,28 @@ fn print_nested_body_lines(
 
 /// Ruby `NA.output_children`: append ` @tags(a,b-c)` for tags other than `due`, `flagged`, `done`
 /// (`na_gem/lib/na/actions.rb`). Values use `name-value` like `priority-5`.
+/// Ruby nest headers use absolute paths (`NA::Todo` expands `--file`); omnifocus applies `~`.
+fn nest_header_source_path(source_file: &str) -> String {
+    Path::new(source_file)
+        .canonicalize()
+        .map(|p| p.display().to_string())
+        .unwrap_or_else(|_| source_file.trim_start_matches("./").to_string())
+}
+
+fn nest_header_omnifocus_display(source_file: &str) -> String {
+    let abs = nest_header_source_path(source_file);
+    if let Ok(home) = std::env::var("HOME") {
+        if let Some(rest) = abs.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    abs
+}
+
+fn nest_action_file_header(path: &str, line_idx: usize) -> String {
+    format!("{path}:{line_idx}:")
+}
+
 fn omnifocus_auxiliary_tags_suffix(action: &Action) -> String {
     const EXCLUDED: &[&str] = &["due", "flagged", "done"];
     let mut parts: Vec<String> = Vec::new();
@@ -403,13 +445,7 @@ fn omnifocus_auxiliary_tags_suffix(action: &Action) -> String {
     }
 }
 
-fn print_next_nested(
-    args: &NextArgs,
-    style: OutputStyle,
-    file_labels: &HashMap<String, String>,
-    matches: &[Action],
-    theme: &Theme,
-) {
+fn print_next_nested(args: &NextArgs, style: OutputStyle, matches: &[Action], theme: &Theme) {
     // Ruby `NA::Actions.output` nest mode: file headers and `\t- [#{parent}] #{action}` / omni `output_children`
     // use **full** action text (see `na_gem/lib/na/actions.rb`). Flat `Action#pretty` alone strips `@na`.
     #[derive(Default)]
@@ -424,7 +460,10 @@ fn print_next_nested(
             return;
         }
         let (head, rest) = chain.split_first().expect("non-empty chain");
-        let child = node.children.entry(head.clone()).or_insert_with(OmniNode::default);
+        let child = node
+            .children
+            .entry(head.clone())
+            .or_insert_with(OmniNode::default);
         if rest.is_empty() {
             child.actions.push(action);
         } else {
@@ -434,26 +473,27 @@ fn print_next_nested(
 
     fn print_omni_tree(node: &OmniNode<'_>, level: usize, style: OutputStyle, theme: &Theme) {
         let indent = "\t".repeat(level);
+        // Ruby `NA.output_children`: an `:actions` bucket is handled before sibling project keys,
+        // which advances `indent` by one tab even when that bucket is empty.
+        let branch_indent = format!("{indent}\t");
         for (name, child) in &node.children {
             let header = if style.color {
                 format!(
-                    "{indent}{}",
+                    "{branch_indent}{}",
                     paint_themed(&format!("{name}:"), &theme.project)
                 )
             } else {
-                format!("{indent}{name}:")
+                format!("{branch_indent}{name}:")
             };
             println!("{}", header);
             print_omni_tree(child, level + 1, style, theme);
         }
         if !node.actions.is_empty() {
-            let line_indent = format!("{indent}\t");
+            // Action lines use the same indent Ruby leaves after processing `:actions`
+            // (`item = "#{indent}- #{a.action}"` — no extra tab vs project headers).
+            let line_indent = branch_indent.clone();
             for a in &node.actions {
-                let plain = format!(
-                    "{}{}",
-                    a.text,
-                    omnifocus_auxiliary_tags_suffix(a)
-                );
+                let plain = format!("{}{}", a.text, omnifocus_auxiliary_tags_suffix(a));
                 let lead = format!("{line_indent}- ");
                 print_nested_body_lines(
                     &plain,
@@ -467,10 +507,7 @@ fn print_next_nested(
                 if style.include_notes {
                     for n in &a.notes {
                         if style.color {
-                            println!(
-                                "{line_indent}\t{}",
-                                paint_themed(n, &theme.note)
-                            );
+                            println!("{line_indent}\t{}", paint_themed(n, &theme.note));
                         } else {
                             println!("{line_indent}\t{n}");
                         }
@@ -480,62 +517,48 @@ fn print_next_nested(
         }
     }
 
-    let by_file = group_actions_by_file(matches);
-    for (file, actions_in_file) in by_file {
-        let display = file_labels
-            .get(&file)
-            .cloned()
-            .unwrap_or_else(|| file.clone());
-        let display = display.trim_start_matches("./").to_string();
+    // Mirror Ruby `NA::Actions.output`: group key is `path:line` per action, so each action gets
+    // its own `path:line:` banner (see `NA::Action#initialize`).
+    for action in matches {
+        let header_path = if args.omnifocus {
+            nest_header_omnifocus_display(&action.source_file)
+        } else {
+            nest_header_source_path(&action.source_file)
+        };
+        println!(
+            "{}",
+            nest_action_file_header(&header_path, action.line_index)
+        );
 
-        println!("{}", nested_file_title(&display, style.color, theme));
         if args.omnifocus {
             let mut root = OmniNode::default();
-            for a in &actions_in_file {
-                omni_insert(&mut root, &a.project_chain, a);
-            }
+            omni_insert(&mut root, &action.project_chain, action);
             print_omni_tree(&root, 0, style, theme);
         } else {
-            for action in actions_in_file {
-                let chain = action.project_chain.join("/");
-                let bracket = nested_bracketed_chain(&chain, style.color, theme);
-                let plain = action.text.clone();
-                let lead = format!("\t- {bracket} ");
-                print_nested_body_lines(
-                    &plain,
-                    &lead,
-                    style,
-                    theme,
-                    &action.tags,
-                    !style.include_notes,
-                    !action.notes.is_empty(),
-                );
-                if style.include_notes {
-                    for note in &action.notes {
-                        if style.color {
-                            println!("\t\t{}", paint_themed(note, &theme.note));
-                        } else {
-                            println!("\t\t{note}");
-                        }
+            let chain = action.project_chain.join("/");
+            let bracket = nested_bracketed_chain(&chain, style.color, theme);
+            let plain = action.text.clone();
+            let lead = format!("\t- {bracket} ");
+            print_nested_body_lines(
+                &plain,
+                &lead,
+                style,
+                theme,
+                &action.tags,
+                !style.include_notes,
+                !action.notes.is_empty(),
+            );
+            if style.include_notes {
+                for note in &action.notes {
+                    if style.color {
+                        println!("\t\t{}", paint_themed(note, &theme.note));
+                    } else {
+                        println!("\t\t{note}");
                     }
                 }
             }
         }
     }
-}
-
-fn group_actions_by_file(actions: &[Action]) -> Vec<(String, Vec<&Action>)> {
-    let mut out: Vec<(String, Vec<&Action>)> = Vec::new();
-    for action in actions {
-        if let Some(last) = out.last_mut() {
-            if last.0 == action.source_file {
-                last.1.push(action);
-                continue;
-            }
-        }
-        out.push((action.source_file.clone(), vec![action]));
-    }
-    out
 }
 
 fn run_next_plugin_merge(args: &NextArgs, actions: &[Action]) -> Result<Option<Vec<Action>>> {
@@ -570,7 +593,11 @@ fn load_next_todo_files(cli: &Cli, args: &NextArgs) -> Result<Vec<TodoFile>> {
     };
 
     if !args.in_todo.is_empty() {
-        let needles: Vec<String> = args.in_todo.iter().map(|s| s.to_ascii_lowercase()).collect();
+        let needles: Vec<String> = args
+            .in_todo
+            .iter()
+            .map(|s| s.to_ascii_lowercase())
+            .collect();
         files.retain(|path| {
             let candidate = path.to_string_lossy().to_ascii_lowercase();
             needles.iter().any(|needle| candidate.contains(needle))
@@ -620,7 +647,7 @@ fn render_next_time_block(cli: &Cli, args: &NextArgs, actions: &[Action]) -> Res
     };
     let flags = TimeOutputFlags {
         human: args.human,
-        inline_times: args.times && !args.only_times,
+        inline_times: (args.times || args.only_timed) && !args.only_times,
         only_times: args.only_times,
         json_times: args.json_times,
     };
@@ -646,7 +673,7 @@ fn render_find_time_block(cli: &Cli, args: &FindArgs, actions: &[Action]) -> Res
     };
     let flags = TimeOutputFlags {
         human: args.human,
-        inline_times: args.times && !args.only_times,
+        inline_times: (args.times || args.only_timed) && !args.only_times,
         only_times: args.only_times,
         json_times: args.json_times,
     };
@@ -671,7 +698,10 @@ fn render_actions_time_summary(
     }
 
     if flags.json_times {
-        println!("{}", serialize_json_times(actions, &totals_by_tag, total_seconds)?);
+        println!(
+            "{}",
+            serialize_json_times(actions, &totals_by_tag, total_seconds)?
+        );
         return Ok(());
     }
 
@@ -679,9 +709,7 @@ fn render_actions_time_summary(
         if flags.only_times {
             continue;
         }
-        let fp = file_labels
-            .get(&action.source_file)
-            .map(String::as_str);
+        let fp = file_labels.get(&action.source_file).map(String::as_str);
         let mut line = format_action(&action, style, fp, theme, omit_filename);
         if flags.inline_times {
             if let Some((_, _, secs)) = action_timing_window(action) {
@@ -725,7 +753,8 @@ fn build_next_query(args: &NextArgs) -> Result<Query> {
     if next_requires_na(args) {
         predicates.push(format!("@{na_tag}"));
     }
-    let done_enabled = args.done || args.times || args.only_timed || args.json_times || args.only_times;
+    let done_enabled =
+        args.done || args.times || args.only_timed || args.json_times || args.only_times;
     if !done_enabled {
         predicates.push("not @done".to_string());
     }
@@ -824,6 +853,9 @@ fn apply_next_search_filter(mut actions: Vec<Action>, args: &NextArgs) -> Result
 }
 
 fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
+    if args.query.trim().is_empty() {
+        anyhow::bail!("find requires a search pattern (try `na tagged ...` for tag-only filters)");
+    }
     if let Some(title) = args.save.as_deref() {
         let mut next_args = implicit_next_args();
         next_args.filter = Some(args.query.clone());
@@ -831,10 +863,7 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
     }
     let files = load_find_todo_files(cli, args)?;
     let mut matches = find_actions_with_options(&files, args)?;
-    let effective_done = args.done
-        || args.json_times
-        || args.only_times
-        || args.only_timed;
+    let effective_done = args.done || args.json_times || args.only_times || args.only_timed;
     if !effective_done {
         matches.retain(|a| !a.done);
     }
@@ -843,12 +872,20 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
     }
     if let Some(project) = &args.project {
         let needle = project.to_ascii_lowercase();
-        matches.retain(|a| a.project_chain.iter().any(|p| p.to_ascii_lowercase().contains(&needle)));
+        matches.retain(|a| {
+            a.project_chain
+                .iter()
+                .any(|p| p.to_ascii_lowercase().contains(&needle))
+        });
     }
     if !args.tagged.is_empty() {
         matches.retain(|a| {
             args.tagged.iter().all(|t| {
-                let tag = if t.starts_with('@') { t.to_ascii_lowercase() } else { format!("@{}", t.to_ascii_lowercase()) };
+                let tag = if t.starts_with('@') {
+                    t.to_ascii_lowercase()
+                } else {
+                    format!("@{}", t.to_ascii_lowercase())
+                };
                 a.tags.iter().any(|x| x.eq_ignore_ascii_case(&tag))
             })
         });
@@ -868,7 +905,7 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
         matches = merged;
     }
 
-    let wants_time_block = args.times || args.json_times || args.only_times;
+    let wants_time_block = args.times || args.json_times || args.only_times || args.only_timed;
     if wants_time_block && (args.json_times || !args.nest_for_display()) {
         return render_find_time_block(cli, args, &matches);
     }
@@ -897,14 +934,16 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
                 ..implicit_next_args()
             },
             style,
-            &file_labels,
             &matches,
             &theme,
         );
     } else {
         for action in matches {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!("{}", format_action(&action, style, file_prefix, &theme, args.no_file));
+            println!(
+                "{}",
+                format_action(&action, style, file_prefix, &theme, args.no_file)
+            );
         }
     }
     Ok(())
@@ -996,7 +1035,13 @@ fn run_tagged(cli: &Cli, args: &TaggedArgs) -> Result<()> {
         find.query = args
             .tags
             .iter()
-            .map(|t| if t.starts_with('@') { t.clone() } else { format!("@{t}") })
+            .map(|t| {
+                if t.starts_with('@') {
+                    t.clone()
+                } else {
+                    format!("@{t}")
+                }
+            })
             .collect::<Vec<_>>()
             .join(" ");
     }
@@ -1018,7 +1063,8 @@ fn run_completed(cli: &Cli, args: &CompletedArgs) -> Result<()> {
     matches.retain(|a| a.done);
 
     if !args.pattern.is_empty() {
-        matches.retain(|a| completed_matches_pattern(a, &args.pattern, args.effective_search_notes()));
+        matches
+            .retain(|a| completed_matches_pattern(a, &args.pattern, args.effective_search_notes()));
     }
     if let Some(project) = &args.project {
         let needle = project.to_ascii_lowercase();
@@ -1071,14 +1117,16 @@ fn run_completed(cli: &Cli, args: &CompletedArgs) -> Result<()> {
                 ..implicit_next_args()
             },
             style,
-            &file_labels,
             &matches,
             &theme,
         );
     } else {
         for action in matches {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!("{}", format_action(&action, style, file_prefix, &theme, args.no_file));
+            println!(
+                "{}",
+                format_action(&action, style, file_prefix, &theme, args.no_file)
+            );
         }
     }
     Ok(())
@@ -1248,9 +1296,7 @@ fn run_add(cli: &Cli, args: &AddArgs) -> Result<()> {
     let mut files = load_add_todo_files(cli, args)?;
     let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
     let file_idx = choose_add_file_index(&files, interactive)?;
-    let target = files
-        .get_mut(file_idx)
-        .context("No TaskPaper file found")?;
+    let target = files.get_mut(file_idx).context("No TaskPaper file found")?;
     let project = resolve_add_project(target, &args.project, interactive)?;
     let action_text = build_add_text(args);
     let notes = collect_add_notes(args, &args.text)?;
@@ -1268,11 +1314,12 @@ fn choose_add_file_index(files: &[TodoFile], interactive: bool) -> Result<usize>
     if files.len() == 1 || !interactive {
         return Ok(0);
     }
-    let labels: Vec<String> = files
-        .iter()
-        .map(|f| f.path.display().to_string())
-        .collect();
-    choose_from_menu("Multiple todo files found, select target", &labels, interactive)
+    let labels: Vec<String> = files.iter().map(|f| f.path.display().to_string()).collect();
+    choose_from_menu(
+        "Multiple todo files found, select target",
+        &labels,
+        interactive,
+    )
 }
 
 fn load_add_todo_files(cli: &Cli, args: &AddArgs) -> Result<Vec<TodoFile>> {
@@ -1371,7 +1418,11 @@ fn resolve_add_project(todo: &TodoFile, project: &str, interactive: bool) -> Res
     if resolved.len() == 1 || !interactive {
         return Ok(resolved[0].clone());
     }
-    let idx = choose_from_menu("Multiple matching projects found, select target", &resolved, interactive)?;
+    let idx = choose_from_menu(
+        "Multiple matching projects found, select target",
+        &resolved,
+        interactive,
+    )?;
     Ok(resolved[idx].clone())
 }
 
@@ -1664,14 +1715,16 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
                         )
                     })?;
                 if new_text.trim().is_empty() {
-                    anyhow::bail!("Edited action text cannot be empty ({})", action.source_file);
+                    anyhow::bail!(
+                        "Edited action text cannot be empty ({})",
+                        action.source_file
+                    );
                 }
                 let mut m = base_mutation.clone();
                 m.replace_text = Some(expand_date_tags_in_line(&new_text));
                 m.note_lines = new_notes;
                 m.overwrite_notes = true;
-                updated_count +=
-                    todo.apply_mutation_by_lines(&HashSet::from([line_idx]), &m)?;
+                updated_count += todo.apply_mutation_by_lines(&HashSet::from([line_idx]), &m)?;
             }
         }
     } else {
@@ -1688,9 +1741,7 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
 
 /// Ruby `NA::Editor.default_editor`: env chain, then runnable check, then `which` fallback list.
 fn resolve_update_editor(cli_override: Option<&str>) -> Result<String> {
-    const FALLBACK: &[&str] = &[
-        "vim", "vi", "code", "subl", "mate", "mvim", "nano", "emacs",
-    ];
+    const FALLBACK: &[&str] = &["vim", "vi", "code", "subl", "mate", "mvim", "nano", "emacs"];
 
     if let Some(s) = cli_override {
         let t = s.trim();
@@ -1698,7 +1749,10 @@ fn resolve_update_editor(cli_override: Option<&str>) -> Result<String> {
         if editor_first_token_executable(t) {
             return Ok(t.to_string());
         }
-        anyhow::bail!("editor from `--editor` is not runnable on this system: {:?}", t);
+        anyhow::bail!(
+            "editor from `--editor` is not runnable on this system: {:?}",
+            t
+        );
     }
 
     let env_specs = [
@@ -1769,9 +1823,11 @@ fn which_executable_under_path(prog_first_token: &str) -> Option<String> {
 
 /// True when the leading token of `editor_spec` resolves to an executable path.
 fn editor_first_token_executable(editor_spec: &str) -> bool {
-    editor_spec.trim().split_whitespace().next().is_some_and(|prog| {
-        !prog.is_empty() && which_executable_under_path(prog).is_some()
-    })
+    editor_spec
+        .trim()
+        .split_whitespace()
+        .next()
+        .is_some_and(|prog| !prog.is_empty() && which_executable_under_path(prog).is_some())
 }
 
 /// Ruby `NA::Editor.args_for_editor`: extra flags for GUI editors / vim when the spec is a bare binary name.
@@ -2078,8 +2134,11 @@ fn run_open(cli: &Cli, args: &OpenArgs) -> Result<()> {
         let specs = parse_todo_specs(&args.in_todo);
         paths.retain(|p| match_todo_path(p.to_string_lossy().as_ref(), &specs));
     }
-    let Some(path) = paths.first() else { anyhow::bail!("No todo file found"); };
-    let (program, program_args) = open_command_for_target(path, args.editor.as_deref(), args.app.as_deref());
+    let Some(path) = paths.first() else {
+        anyhow::bail!("No todo file found");
+    };
+    let (program, program_args) =
+        open_command_for_target(path, args.editor.as_deref(), args.app.as_deref());
     let status = std::process::Command::new(program)
         .args(program_args)
         .status()?;
@@ -2108,10 +2167,7 @@ fn open_command_for_target(
         }
         #[cfg(not(target_os = "macos"))]
         {
-            return (
-                app.to_string(),
-                vec![path.to_string_lossy().to_string()],
-            );
+            return (app.to_string(), vec![path.to_string_lossy().to_string()]);
         }
     }
     let editor = editor_override
@@ -2152,7 +2208,9 @@ fn run_todos(cli: &Cli, args: &TodosArgs) -> Result<()> {
         println!("{}", p.display());
     }
     if args.edit {
-        let Some(first) = paths.first() else { return Ok(()); };
+        let Some(first) = paths.first() else {
+            return Ok(());
+        };
         let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
         let _ = std::process::Command::new(editor).arg(first).status()?;
     }
@@ -2201,13 +2259,17 @@ fn run_undo(cli: &Cli, args: &UndoArgs) -> Result<()> {
             .cloned()
             .context("No backup candidate")?
     } else {
-        backup_files.first().cloned().context("No backup candidate")?
+        backup_files
+            .first()
+            .cloned()
+            .context("No backup candidate")?
     };
     let target = restore_target_from_backup_path(&pick);
     if let Some(parent) = target.parent() {
         fs::create_dir_all(parent)?;
     }
-    fs::copy(&pick, &target).with_context(|| format!("Failed restoring {:?} to {:?}", pick, target))?;
+    fs::copy(&pick, &target)
+        .with_context(|| format!("Failed restoring {:?} to {:?}", pick, target))?;
     println!("Restored {}", target.display());
     Ok(())
 }
@@ -2489,8 +2551,12 @@ fn update_paths_equivalent(loaded: &Path, query: &Path) -> bool {
     if loaded == query {
         return true;
     }
-    let ls = update_path_for_compare(loaded).trim_start_matches("./").to_string();
-    let qs = update_path_for_compare(query).trim_start_matches("./").to_string();
+    let ls = update_path_for_compare(loaded)
+        .trim_start_matches("./")
+        .to_string();
+    let qs = update_path_for_compare(query)
+        .trim_start_matches("./")
+        .to_string();
     if ls == qs {
         return true;
     }
@@ -2515,8 +2581,7 @@ fn parse_update_path_colon_line_query(query: &str) -> Option<(String, usize)> {
     }
     static RE: OnceLock<regex::Regex> = OnceLock::new();
     let re = RE.get_or_init(|| {
-        regex::Regex::new(r"(?ms)^(?P<p>.+):(?P<n>\d+)$")
-            .expect("update path:line regex")
+        regex::Regex::new(r"(?ms)^(?P<p>.+):(?P<n>\d+)$").expect("update path:line regex")
     });
     let caps = re.captures(q)?;
     let path_str = caps.name("p")?.as_str().trim();
@@ -2541,11 +2606,7 @@ fn seed_matches_update_path_colon_line(files: &[TodoFile], query: &str) -> Optio
     for tf in files {
         if update_paths_equivalent(&tf.path, query_path) {
             saw_matching_file = true;
-            out.extend(
-                tf.actions()
-                    .into_iter()
-                    .filter(|a| a.line_index == idx),
-            );
+            out.extend(tf.actions().into_iter().filter(|a| a.line_index == idx));
         }
     }
     if !saw_matching_file {
@@ -2564,12 +2625,20 @@ fn collect_update_candidates(files: &[TodoFile], args: &UpdateArgs) -> Result<Ve
     };
     if let Some(project) = &args.project {
         let needle = project.to_ascii_lowercase();
-        out.retain(|a| a.project_chain.iter().any(|p| p.to_ascii_lowercase().contains(&needle)));
+        out.retain(|a| {
+            a.project_chain
+                .iter()
+                .any(|p| p.to_ascii_lowercase().contains(&needle))
+        });
     }
     if !args.tagged.is_empty() {
         out.retain(|a| {
             args.tagged.iter().all(|t| {
-                let tag = if t.starts_with('@') { t.to_ascii_lowercase() } else { format!("@{}", t.to_ascii_lowercase()) };
+                let tag = if t.starts_with('@') {
+                    t.to_ascii_lowercase()
+                } else {
+                    format!("@{}", t.to_ascii_lowercase())
+                };
                 a.tags.iter().any(|x| x.eq_ignore_ascii_case(&tag))
             })
         });
@@ -2577,7 +2646,11 @@ fn collect_update_candidates(files: &[TodoFile], args: &UpdateArgs) -> Result<Ve
     Ok(out)
 }
 
-fn update_seed_matches(files: &[TodoFile], pattern: &str, args: &UpdateArgs) -> Result<Vec<Action>> {
+fn update_seed_matches(
+    files: &[TodoFile],
+    pattern: &str,
+    args: &UpdateArgs,
+) -> Result<Vec<Action>> {
     let query = pattern.trim();
     if query.starts_with("@search(") && !args.regex && !args.exact {
         let parsed = Query::parse(query)?;
@@ -2996,30 +3069,28 @@ fn _single_target(cli: &Cli) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        abbreviate_source_path, add_position_is_append, build_add_text,
-        choose_from_menu, completed_matches_date, completed_matches_pattern, find_actions,
-        find_actions_with_options,
-        format_saved_search, implicit_next_args, is_cancel_selection, load_next_todo_files,
-        list_saved_searches, load_update_todo_files, match_todo_path, next_actions,
-        editor_program_and_extra_args, omnifocus_auxiliary_tags_suffix, parse_multi_selection,
-        parse_multi_action_edit_output, update_seed_matches,
-        parse_one_based_selection, parse_priority_value, parse_tag_input, parse_tag_datetime,
-        open_command_for_target, parse_todo_specs, prompt_profile_path, read_scan_registry,
-        restore_target_from_backup_path, run_archive, run_edit, run_move,
-        run_plugin, run_prompt, run_saved, run_scan, run_tag,
-        run_undo, run_update, save_next_search, saved_search_path, saved_search_slug,
-        shell_quote_token, strip_trailing_note, write_scan_registry,
+        abbreviate_source_path, add_position_is_append, build_add_text, choose_from_menu,
+        completed_matches_date, completed_matches_pattern, editor_program_and_extra_args,
+        find_actions, find_actions_with_options, format_saved_search, implicit_next_args,
+        is_cancel_selection, list_saved_searches, load_next_todo_files, load_update_todo_files,
+        match_todo_path, next_actions, omnifocus_auxiliary_tags_suffix, open_command_for_target,
+        parse_multi_action_edit_output, parse_multi_selection, parse_one_based_selection,
+        parse_priority_value, parse_tag_datetime, parse_tag_input, parse_todo_specs,
+        prompt_profile_path, read_scan_registry, restore_target_from_backup_path, run_archive,
+        run_edit, run_move, run_plugin, run_prompt, run_saved, run_scan, run_tag, run_undo,
+        run_update, save_next_search, saved_search_path, saved_search_slug, shell_quote_token,
+        strip_trailing_note, update_seed_matches, write_scan_registry,
     };
     use crate::cli::{
-        AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs,
-        NextArgs, PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs,
-        UndoArgs, UpdateArgs,
+        AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs, NextArgs,
+        PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs, UndoArgs,
+        UpdateArgs,
     };
-    use crate::output::duration::action_elapsed_seconds;
-    use crate::parser::item_path::resolve_item_path;
     use crate::io::xdg::TEST_ENV_MUTEX;
     use crate::models::action::Action;
     use crate::models::todo::TodoFile;
+    use crate::output::duration::action_elapsed_seconds;
+    use crate::parser::item_path::resolve_item_path;
     use clap::Parser;
     use std::collections::{HashMap, HashSet};
     use std::fs;
@@ -3242,12 +3313,8 @@ Inbox:
             + 1;
         let full = tp.to_string_lossy().replace('\\', "/");
         let args = base_update_args();
-        let hits = update_seed_matches(
-            &[todo.clone()],
-            &format!("{full}:{line_1based}"),
-            &args,
-        )
-        .expect("full path");
+        let hits = update_seed_matches(&[todo.clone()], &format!("{full}:{line_1based}"), &args)
+            .expect("full path");
         assert_eq!(hits.len(), 1, "{full}:{line_1based}");
         let hits_short = update_seed_matches(
             &[todo],
@@ -3390,8 +3457,7 @@ ProjectB:
 "#,
         );
         let todo = TodoFile::load(&path).expect("fixture should load");
-        let out =
-            find_actions(&[todo], r#"@search(@priority > 3)"#).expect("find should evaluate");
+        let out = find_actions(&[todo], r#"@search(@priority > 3)"#).expect("find should evaluate");
         fs::remove_file(path).ok();
 
         assert_eq!(out.len(), 1);
@@ -3616,7 +3682,10 @@ ProjectB:
 
     #[test]
     fn saved_search_slug_normalizes_and_collapses_separators() {
-        assert_eq!(saved_search_slug("  Weekly Focus / Work  "), "weekly_focus_work");
+        assert_eq!(
+            saved_search_slug("  Weekly Focus / Work  "),
+            "weekly_focus_work"
+        );
         assert_eq!(saved_search_slug("___"), "");
         assert_eq!(saved_search_slug("Roadmap v2"), "roadmap_v2");
     }
@@ -3630,10 +3699,19 @@ ProjectB:
         args.file = Some(PathBuf::from("/tmp/with space.taskpaper"));
         args.save = Some("My Saved Search".to_string());
         let formatted = format_saved_search(&args);
-        assert!(formatted.starts_with("na next --first-available"), "{formatted}");
-        assert!(formatted.contains("--project 'Client Alpha'"), "{formatted}");
+        assert!(
+            formatted.starts_with("na next --first-available"),
+            "{formatted}"
+        );
+        assert!(
+            formatted.contains("--project 'Client Alpha'"),
+            "{formatted}"
+        );
         assert!(formatted.contains("--search 'one two'"), "{formatted}");
-        assert!(formatted.contains("--file '/tmp/with space.taskpaper'"), "{formatted}");
+        assert!(
+            formatted.contains("--file '/tmp/with space.taskpaper'"),
+            "{formatted}"
+        );
         assert!(!formatted.contains("--save"), "{formatted}");
     }
 
@@ -3845,7 +3923,10 @@ ProjectB:
         let specs = parse_todo_specs(&["work,+client,-archive".to_string()]);
         assert!(match_todo_path("/tmp/work-client.taskpaper", &specs));
         assert!(!match_todo_path("/tmp/work.taskpaper", &specs));
-        assert!(!match_todo_path("/tmp/work-client-archive.taskpaper", &specs));
+        assert!(!match_todo_path(
+            "/tmp/work-client-archive.taskpaper",
+            &specs
+        ));
     }
 
     #[test]
@@ -4106,7 +4187,10 @@ Inbox:
         run_update(&cli, &args).expect("run_update should succeed");
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
-        assert!(updated.contains("Inbox:\n- Keep here\n- Move me @na"), "{updated}");
+        assert!(
+            updated.contains("Inbox:\n- Keep here\n- Move me @na"),
+            "{updated}"
+        );
     }
 
     #[test]
@@ -4143,7 +4227,10 @@ Inbox:
         run_move(&cli, &args).expect("move should succeed");
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
-        assert!(updated.contains("Inbox:\n- Move me @na\n- Existing"), "{updated}");
+        assert!(
+            updated.contains("Inbox:\n- Move me @na\n- Existing"),
+            "{updated}"
+        );
     }
 
     #[test]
@@ -4180,7 +4267,10 @@ Inbox:
         run_move(&cli, &args).expect("move should succeed");
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
-        assert!(updated.contains("Inbox:\n- Existing\n- Move me @na"), "{updated}");
+        assert!(
+            updated.contains("Inbox:\n- Existing\n- Move me @na"),
+            "{updated}"
+        );
     }
 
     #[test]
@@ -4260,7 +4350,10 @@ Inbox:
         run_update(&cli, &args).expect("run_update archive should succeed");
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
-        assert!(updated.contains("Archive:\n- Archive me @done("), "{updated}");
+        assert!(
+            updated.contains("Archive:\n- Archive me @done("),
+            "{updated}"
+        );
         assert!(updated.contains("- Keep me"), "{updated}");
     }
 
@@ -4442,7 +4535,10 @@ Inbox:
             .iter()
             .map(|f| f.path.to_string_lossy().to_string())
             .collect::<Vec<_>>();
-        assert!(loaded_paths.iter().any(|p| p.contains("keep_work_client")), "{loaded_paths:?}");
+        assert!(
+            loaded_paths.iter().any(|p| p.contains("keep_work_client")),
+            "{loaded_paths:?}"
+        );
         assert!(
             !loaded_paths.iter().any(|p| p.contains("drop_home_archive")),
             "{loaded_paths:?}"
@@ -4463,9 +4559,14 @@ Inbox:
         let mut args = base_completed_args();
         args.pattern = vec!["feature".to_string()];
         args.after = Some("2026-04-19".to_string());
-        let mut actions: Vec<Action> = vec![todo.actions()[0].clone(), todo.actions()[1].clone(), todo.actions()[2].clone()];
+        let mut actions: Vec<Action> = vec![
+            todo.actions()[0].clone(),
+            todo.actions()[1].clone(),
+            todo.actions()[2].clone(),
+        ];
         actions.retain(|a| a.done);
-        actions.retain(|a| completed_matches_pattern(a, &args.pattern, args.effective_search_notes()));
+        actions
+            .retain(|a| completed_matches_pattern(a, &args.pattern, args.effective_search_notes()));
         let after = args.after.as_deref().and_then(parse_tag_datetime);
         actions.retain(|a| completed_matches_date(a, None, None, after, args.or_mode));
         assert_eq!(actions.len(), 1);
@@ -4543,7 +4644,8 @@ Inbox:
         let path = saved_search_path("Smoke").expect("saved path should build");
         fs::create_dir_all(path.parent().expect("search dir should exist"))
             .expect("search dir should create");
-        fs::write(&path, format!("echo OK > {}", output.display())).expect("saved search should write");
+        fs::write(&path, format!("echo OK > {}", output.display()))
+            .expect("saved search should write");
 
         run_saved(&SavedCommands::Run {
             title: "Smoke".to_string(),
@@ -4730,7 +4832,10 @@ Inbox:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&plugin).expect("metadata").permissions().mode();
+            let mode = fs::metadata(&plugin)
+                .expect("metadata")
+                .permissions()
+                .mode();
             assert_eq!(mode & 0o111, 0);
         }
 
@@ -4744,7 +4849,10 @@ Inbox:
         #[cfg(unix)]
         {
             use std::os::unix::fs::PermissionsExt;
-            let mode = fs::metadata(&plugin).expect("metadata").permissions().mode();
+            let mode = fs::metadata(&plugin)
+                .expect("metadata")
+                .permissions()
+                .mode();
             assert_ne!(mode & 0o111, 0);
         }
 
@@ -4867,7 +4975,10 @@ Inbox:
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
 
-        assert!(updated.contains("Archive:\n- Ship this @na @done("), "{updated}");
+        assert!(
+            updated.contains("Archive:\n- Ship this @na @done("),
+            "{updated}"
+        );
         assert!(updated.contains("- Keep this open"), "{updated}");
     }
 

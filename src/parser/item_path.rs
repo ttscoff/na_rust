@@ -60,7 +60,11 @@ pub fn resolve_item_path(path: &str, projects: &[String]) -> Vec<String> {
     }
     let chains: Vec<Vec<String>> = projects
         .iter()
-        .map(|p| p.split(':').map(|s| s.trim().to_string()).collect::<Vec<_>>())
+        .map(|p| {
+            p.split(':')
+                .map(|s| s.trim().to_string())
+                .collect::<Vec<_>>()
+        })
         .collect();
     let mut current: Vec<Vec<String>> = vec![Vec::new()];
     for step in steps {
@@ -109,10 +113,7 @@ pub fn resolve_item_path(path: &str, projects: &[String]) -> Vec<String> {
             break;
         }
     }
-    current
-        .into_iter()
-        .map(|c| c.join(":"))
-        .collect()
+    current.into_iter().map(|c| c.join(":")).collect()
 }
 
 /// True if `chain` denotes a project hierarchy that matches path expression (same steps as [`resolve_item_path`]).
@@ -160,11 +161,7 @@ mod tests {
 
     #[test]
     fn matches_child_and_descendant_segments() {
-        let chain = vec![
-            "Work".to_string(),
-            "ClientA".to_string(),
-            "Ops".to_string(),
-        ];
+        let chain = vec!["Work".to_string(), "ClientA".to_string(), "Ops".to_string()];
         assert!(project_chain_matches_path(&chain, "/Work/ClientA"));
         assert!(project_chain_matches_path(&chain, "/Work/ClientA/Ops"));
         assert!(!project_chain_matches_path(&chain, "/Work/ClientB"));

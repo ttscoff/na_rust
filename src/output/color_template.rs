@@ -6,8 +6,7 @@ use std::sync::OnceLock;
 fn hex_regex() -> &'static Regex {
     static RE: OnceLock<Regex> = OnceLock::new();
     RE.get_or_init(|| {
-        Regex::new(r"^(?:(f|fg|b|bg))?#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$")
-            .expect("hex color regex")
+        Regex::new(r"^(?:(f|fg|b|bg))?#([0-9a-fA-F]{3}|[0-9a-fA-F]{6})$").expect("hex color regex")
     })
 }
 

@@ -1,0 +1,22 @@
+{
+  "scenarios": [
+    {
+      "name": "tagged json-times",
+      "fixture": "timed.taskpaper",
+      "tags": ["@na"],
+      "args": ["--json-times"]
+    },
+    {
+      "name": "tagged only-times",
+      "fixture": "timed.taskpaper",
+      "tags": ["@na"],
+      "args": ["--only-times"]
+    },
+    {
+      "name": "tagged only-timed",
+      "fixture": "timed.taskpaper",
+      "tags": ["@na"],
+      "args": ["--only-timed"]
+    }
+  ]
+}

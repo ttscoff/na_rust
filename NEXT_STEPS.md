@@ -42,11 +42,10 @@ Relative to the original audit below, large pieces are in place:
 
 **Still clearly behind or partial vs the gem** (see README “Known Gaps”):
 
-- **`--nest` / `--omnifocus`:** Structure and note `*` behavior exist; output is
-  **plain text** (no `theme.yaml` styling), **no terminal wrap** on nested lines,
-  possible minor path/header edge differences vs Ruby. With time flags,
-  **`--json-times` still emits JSON**; non-JSON time decoration is intentionally
-  skipped in nested mode (same idea as Ruby’s nest branch vs inline durations).
+- **`--nest` / `--omnifocus`:** Match Ruby’s **`path:line:`** headers, tag/bracket
+  theming, OmniFocus trees, and `$COLUMNS` wrap on bodies; see **`diff_next`**
+  nest/omnifocus scenarios. With time flags, **`--json-times` still emits JSON**;
+  non-JSON time decoration is skipped on nested action lines (same as the gem).
 - **Action line:** Tag stripping/formatting beyond **`@na`** may still diverge.
 - **`update` / mutations:** Non-interactive baseline + fixtures; interactive /
   legacy delegation paths and full semantic parity are partial.
@@ -139,30 +138,31 @@ addressed (see snapshot above).
 - **Time output parity (flat):** Ruby-matched duration formatting, JSON, markdown
   summary, full action listing with optional duration suffixes; extended to `find` /
   `tagged` (`--only-timed`, `--json-times`, `--only-times`).
+- **Differential time scenarios:** `fixtures/next`, `find`, and `tagged` include timed
+  TaskPaper fixtures; `diff_next.py`, `diff_find.py`, and `diff_tagged.py` run with
+  **`TZ=UTC`** and normalize spacing/JSON so CI can catch duration and JSON regressions.
+- **Nested `next` parity:** **`--nest`** and **`--omnifocus`** match Ruby’s **`path:line:`**
+  banners, OmniFocus trees (tabs/`@tags`), and **`diff_next`** scenarios with stable path
+  normalization.
 
 ## Prioritized next steps
 
 Ordered roughly by impact for “feels like the gem” / reducing surprise:
 
-1. **Nested output polish** — Optional `theme.yaml` colors for `--nest` /
-   `--omnifocus`, `$COLUMNS` wrap for nested action lines, and differential checks
-   vs Ruby for file headers and paths.
+1. **Nested output polish** — **Done (baseline):** `path:line:` banners, OmniFocus
+   indentation/tree parity, `$COLUMNS` wrap for nested bodies, and **`diff_next`**
+   scenarios for **`--nest`** / **`--omnifocus`**. **Remaining:** optional
+   `theme.duration`-style time suffixes on nested lines (if desired), and more
+   fixtures for edge cases.
 2. **Flat action text parity** — Strip/format tags beyond `@na` to match Ruby in the
    relevant modes (fixture-driven).
 3. **`update` / mutation depth** — Close gaps on interactive editor paths,
    `PATH:LINE` edge cases, and mutation ordering vs Ruby where fixtures exist.
-4. **Differential scenarios for time output** — Extend `fixtures/next/scenarios.json`
-   and `fixtures/find/scenarios.json` (and regenerate expectations as needed) so
-   `scripts/diff_next.py` and `scripts/diff_find.py` exercise **`--times`**,
-   **`--human`**, **`--json-times`**, **`--only-times`**, and **`--only-timed`**
-   against Ruby with stable fixtures (timed `@started` / `@done` tasks). Goal:
-   CI catches regressions in duration strings, JSON shape, and markdown footer —
-   complementing unit tests in `src/output/duration.rs`.
-5. **Plugin action applications** — Ensure plugin-returned operations (`MOVE`,
+4. **Plugin action applications** — Ensure plugin-returned operations (`MOVE`,
    `ADD_TAG`, …) match Ruby behavior where the runner claims support.
-6. **Config file resolution** — If desired: implement Ruby-compatible `na.rc` /
+5. **Config file resolution** — If desired: implement Ruby-compatible `na.rc` /
    config lookup (`$XDG_CONFIG_HOME/na/…`, fallbacks) and document intentional diffs.
-7. **Continuous differential hygiene** — Run `scripts/diff_*.py` after substantive
+6. **Continuous differential hygiene** — Run `scripts/diff_*.py` after substantive
    changes; extend scenario JSON when fixing a parity bug.
 
 Smaller follow-ups:
@@ -177,7 +177,7 @@ search storage paths with Ruby if users rely on interchangeability.
 
 ## Release gates
 
-- Differential parity runs documented per command group (`next`, `find`,
+- Differential parity runs documented per command group (`next`, `find`, `tagged`,
   `completed`, `update`, `archive`, `plugin run`) where applicable.
 - No critical regressions in mutation safety (backups + file content assertions in tests).
 - CLI help and **README** parity sections updated when behavior changes.

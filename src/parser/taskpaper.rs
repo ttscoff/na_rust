@@ -47,7 +47,8 @@ pub fn extract_actions(lines: &[String], path: &Path) -> Vec<Action> {
             }
         }
         let done = tags.iter().any(|t| t == "@done");
-        let project_chain: Vec<String> = project_stack.iter().map(|(_, name)| name.clone()).collect();
+        let project_chain: Vec<String> =
+            project_stack.iter().map(|(_, name)| name.clone()).collect();
         let mut notes = Vec::new();
         let mut note_idx = idx + 1;
         while note_idx < lines.len() {

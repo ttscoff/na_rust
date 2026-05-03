@@ -144,7 +144,9 @@ fn interval_to_datetime(iv: Interval, now: DateTime<Utc>) -> Option<DateTime<Utc
     match iv {
         Interval::Seconds(s) => now.checked_add_signed(Duration::seconds(s as i64)),
         Interval::Days(d) => {
-            let date = now.date_naive().checked_add_signed(Duration::days(d as i64))?;
+            let date = now
+                .date_naive()
+                .checked_add_signed(Duration::days(d as i64))?;
             let nn = date.and_time(now.time());
             Some(Utc.from_utc_datetime(&nn))
         }
@@ -169,16 +171,12 @@ mod tests {
     fn expand_started_done_like_ruby_test() {
         let s = "Task @started(2 hours ago) @done(now)";
         let out = expand_date_tags_in_line(s);
-        assert!(
-            Regex::new(r"@started\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)")
-                .unwrap()
-                .is_match(&out)
-        );
-        assert!(
-            Regex::new(r"@done\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)")
-                .unwrap()
-                .is_match(&out)
-        );
+        assert!(Regex::new(r"@started\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)")
+            .unwrap()
+            .is_match(&out));
+        assert!(Regex::new(r"@done\(\d{4}-\d{2}-\d{2} \d{2}:\d{2}\)")
+            .unwrap()
+            .is_match(&out));
     }
 
     #[test]

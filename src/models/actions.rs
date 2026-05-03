@@ -1,13 +1,22 @@
 use crate::models::action::Action;
 use std::collections::HashSet;
 
-pub fn first_available_per_project(actions: Vec<Action>, require_na: bool, na_tag: &str) -> Vec<Action> {
+pub fn first_available_per_project(
+    actions: Vec<Action>,
+    require_na: bool,
+    na_tag: &str,
+) -> Vec<Action> {
     let mut seen = HashSet::new();
     let mut out = Vec::new();
     let expected_tag = format!("@{}", na_tag.trim_start_matches('@'));
 
     for action in actions {
-        if require_na && !action.tags.iter().any(|t| t.eq_ignore_ascii_case(&expected_tag)) {
+        if require_na
+            && !action
+                .tags
+                .iter()
+                .any(|t| t.eq_ignore_ascii_case(&expected_tag))
+        {
             continue;
         }
 
@@ -52,7 +61,10 @@ mod tests {
         ];
         let out = first_available_per_project(actions, true, "na");
         let projects: Vec<String> = out.iter().filter_map(|a| a.project.clone()).collect();
-        assert_eq!(projects, vec!["ProjectA".to_string(), "ProjectB".to_string()]);
+        assert_eq!(
+            projects,
+            vec!["ProjectA".to_string(), "ProjectB".to_string()]
+        );
         assert!(out[0].text.contains("First A"));
     }
 
@@ -66,7 +78,10 @@ mod tests {
         ];
         let out = first_available_per_project(actions, false, "na");
         let projects: Vec<String> = out.iter().filter_map(|a| a.project.clone()).collect();
-        assert_eq!(projects, vec!["ProjectA".to_string(), "ProjectB".to_string()]);
+        assert_eq!(
+            projects,
+            vec!["ProjectA".to_string(), "ProjectB".to_string()]
+        );
         assert_eq!(out[0].text, "First A no tag");
         assert_eq!(out[1].text, "First B no tag");
     }

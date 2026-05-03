@@ -50,7 +50,9 @@ impl PluginRegistry {
 
     pub fn discover(dir: &Path) -> Result<Self> {
         if !dir.exists() {
-            return Ok(Self { plugins: Vec::new() });
+            return Ok(Self {
+                plugins: Vec::new(),
+            });
         }
 
         let mut plugins = Vec::new();
@@ -229,13 +231,13 @@ fn parse_format_hints(path: &Path) -> Result<(PluginDataFormat, PluginDataFormat
 
     for line in reader.lines().take(20) {
         let line = line?;
-        if let Some(value) = parse_hint_value(&line, "na:input=")
-            .or_else(|| parse_hint_value(&line, "na-input="))
+        if let Some(value) =
+            parse_hint_value(&line, "na:input=").or_else(|| parse_hint_value(&line, "na-input="))
         {
             input = PluginDataFormat::parse(value).unwrap_or(PluginDataFormat::Json);
         }
-        if let Some(value) = parse_hint_value(&line, "na:output=")
-            .or_else(|| parse_hint_value(&line, "na-output="))
+        if let Some(value) =
+            parse_hint_value(&line, "na:output=").or_else(|| parse_hint_value(&line, "na-output="))
         {
             output = PluginDataFormat::parse(value).unwrap_or(PluginDataFormat::Json);
         }
@@ -255,12 +257,16 @@ fn parse_hint_value<'a>(line: &'a str, key: &str) -> Option<&'a str> {
         .unwrap_or("")
         .trim_matches('"')
         .trim_matches('\'');
-    if token.is_empty() { None } else { Some(token) }
+    if token.is_empty() {
+        None
+    } else {
+        Some(token)
+    }
 }
 
 #[cfg(test)]
 mod tests {
-    use super::{parse_hint_value, parse_format_hints, PluginRegistry};
+    use super::{parse_format_hints, parse_hint_value, PluginRegistry};
     use crate::io::xdg::TEST_ENV_MUTEX;
     use crate::plugins::format::PluginDataFormat;
     use std::fs;

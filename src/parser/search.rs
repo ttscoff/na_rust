@@ -63,10 +63,9 @@ impl Query {
             return Self::parse_taskpaper_search(trimmed);
         }
         let clause = Self::parse_simple_clause(trimmed);
-        let include_done = clause
-            .tags
-            .iter()
-            .any(|tag| tag.eq_ignore_ascii_case("@done") || tag.to_ascii_lowercase().starts_with("@done("));
+        let include_done = clause.tags.iter().any(|tag| {
+            tag.eq_ignore_ascii_case("@done") || tag.to_ascii_lowercase().starts_with("@done(")
+        });
         Ok(Self {
             clauses: vec![clause],
             include_done,
@@ -105,7 +104,10 @@ impl Query {
 
     fn parse_taskpaper_search(input: &str) -> Result<Self> {
         let mut inner = input.trim();
-        if let Some(stripped) = inner.strip_prefix("@search(").and_then(|s| s.strip_suffix(')')) {
+        if let Some(stripped) = inner
+            .strip_prefix("@search(")
+            .and_then(|s| s.strip_suffix(')'))
+        {
             inner = stripped.trim();
         }
 
@@ -170,29 +172,40 @@ impl Query {
         let comparisons_ok = clause.comparisons.iter().all(|cmp| {
             let actual = action.tag_value(&cmp.tag);
             let base = compare_tag_value(actual, cmp);
-            if cmp.negated { !base } else { base }
+            if cmp.negated {
+                !base
+            } else {
+                base
+            }
         });
 
         let project_names: Vec<&str> = if action.project_chain.is_empty() {
-            action.project.as_deref().map(|p| vec![p]).unwrap_or_default()
+            action
+                .project
+                .as_deref()
+                .map(|p| vec![p])
+                .unwrap_or_default()
         } else {
             action.project_chain.iter().map(String::as_str).collect()
         };
-        let project_ok = clause.project.as_ref().is_none_or(|p| {
-            project_predicate_matches_include(p.trim(), &project_names)
-        });
+        let project_ok = clause
+            .project
+            .as_ref()
+            .is_none_or(|p| project_predicate_matches_include(p.trim(), &project_names));
         let excluded_ok = clause
             .exclude_projects
             .iter()
             .all(|p| !project_predicate_matches_include(p.trim(), &project_names));
 
         let chain_owned: Vec<String> = project_names.iter().map(|s| (*s).to_string()).collect();
-        let item_path_ok = clause.item_path.as_ref().is_none_or(|path| {
-            project_chain_matches_path(&chain_owned, path.trim())
-        });
-        let item_path_excludes_ok = clause.exclude_item_paths.iter().all(|path| {
-            !project_chain_matches_path(&chain_owned, path.trim())
-        });
+        let item_path_ok = clause
+            .item_path
+            .as_ref()
+            .is_none_or(|path| project_chain_matches_path(&chain_owned, path.trim()));
+        let item_path_excludes_ok = clause
+            .exclude_item_paths
+            .iter()
+            .all(|path| !project_chain_matches_path(&chain_owned, path.trim()));
 
         terms_ok
             && tags_ok
@@ -205,7 +218,9 @@ impl Query {
     }
 
     pub fn matches(&self, action: &Action) -> bool {
-        self.clauses.iter().any(|clause| Self::matches_clause(clause, action))
+        self.clauses
+            .iter()
+            .any(|clause| Self::matches_clause(clause, action))
     }
 
     pub fn with_include_done(mut self, include_done: bool) -> Self {
@@ -274,9 +289,7 @@ pub fn evaluate_query(files: &[TodoFile], query: &Query) -> Vec<Action> {
                 let mut matched: Vec<Action> = files
                     .iter()
                     .flat_map(TodoFile::actions)
-                    .filter(|a| {
-                        (query.include_done || !a.done) && Query::matches_clause(clause, a)
-                    })
+                    .filter(|a| (query.include_done || !a.done) && Query::matches_clause(clause, a))
                     .collect();
                 matched = apply_search_slice(matched, slice);
                 for a in matched {
@@ -300,10 +313,7 @@ fn split_trailing_slice(inner: &str) -> (String, Option<SearchSlice>) {
         return (inner.to_string(), None);
     };
     let slice_inner = without_close[open_bracket + 1..].trim();
-    if !slice_inner
-        .chars()
-        .all(|c| c.is_ascii_digit() || c == ':')
-    {
+    if !slice_inner.chars().all(|c| c.is_ascii_digit() || c == ':') {
         return (inner.to_string(), None);
     }
     let expr = without_close[..open_bracket].trim_end();
@@ -467,9 +477,7 @@ fn compare_tag_value(actual: Option<&str>, cmp: &TagComparison) -> bool {
         }
         CompareOp::BeginsWith => {
             if cmp.case_insensitive {
-                actual
-                    .to_lowercase()
-                    .starts_with(&cmp.value.to_lowercase())
+                actual.to_lowercase().starts_with(&cmp.value.to_lowercase())
             } else {
                 actual.starts_with(&cmp.value)
             }
@@ -575,7 +583,9 @@ fn project_predicate_matches_include(pattern: &str, segments: &[&str]) -> bool {
         let joined_colon = segments.join(":");
         glob_star_ordered_match(&joined_gt, pattern)
             || (!joined_gt.is_empty() && glob_star_ordered_match(&joined_colon, pattern))
-            || segments.iter().any(|seg| glob_star_ordered_match(seg, pattern))
+            || segments
+                .iter()
+                .any(|seg| glob_star_ordered_match(seg, pattern))
     } else {
         let pl = pattern.to_lowercase();
         segments
@@ -657,7 +667,13 @@ fn extract_global_not_project(input: &str) -> Vec<String> {
         let idx = start + pos;
         let rest = input[idx + needle.len()..].trim_start();
         if let Some(eq_pos) = rest.find('=') {
-            let value = strip_quotes(rest[eq_pos + 1..].trim().split_whitespace().next().unwrap_or(""));
+            let value = strip_quotes(
+                rest[eq_pos + 1..]
+                    .trim()
+                    .split_whitespace()
+                    .next()
+                    .unwrap_or(""),
+            );
             if !value.is_empty() {
                 out.push(value.to_string());
             }
@@ -731,8 +747,10 @@ mod tests {
 
     #[test]
     fn taskpaper_search_supports_or_and_not_project() {
-        let q = Query::parse(r#"@search(@home or (project = "Errands" and not @done) and not project = "Archive")"#)
-            .expect("query should parse");
+        let q = Query::parse(
+            r#"@search(@home or (project = "Errands" and not @done) and not project = "Archive")"#,
+        )
+        .expect("query should parse");
         let a = Action {
             text: "Buy milk".to_string(),
             line_index: 0,
@@ -778,8 +796,7 @@ mod tests {
 
     #[test]
     fn taskpaper_search_supports_beginswith_operator() {
-        let q =
-            Query::parse(r#"@search(@context beginswith "home")"#).expect("query should parse");
+        let q = Query::parse(r#"@search(@context beginswith "home")"#).expect("query should parse");
         let mut tag_values = HashMap::new();
         tag_values.insert("context".to_string(), "home-office".to_string());
         let a = Action {
@@ -899,8 +916,8 @@ mod tests {
 
     #[test]
     fn taskpaper_search_supports_project_shortcut_without_equals() {
-        let q = Query::parse(r#"@search(project Errands and not @done)"#)
-            .expect("query should parse");
+        let q =
+            Query::parse(r#"@search(project Errands and not @done)"#).expect("query should parse");
         let a = Action {
             text: "Buy milk".to_string(),
             line_index: 0,
@@ -918,7 +935,8 @@ mod tests {
 
     #[test]
     fn taskpaper_search_matches_project_predicate_with_star_wildcard() {
-        let q = Query::parse(r#"@search(project Work*Trail and @home)"#).expect("query should parse");
+        let q =
+            Query::parse(r#"@search(project Work*Trail and @home)"#).expect("query should parse");
         let a = Action {
             text: "Trail item @home".to_string(),
             line_index: 0,
@@ -941,8 +959,8 @@ mod tests {
 
     #[test]
     fn taskpaper_search_supports_matches_operator() {
-        let q = Query::parse(r#"@search(@context matches "^home-.*$")"#)
-            .expect("query should parse");
+        let q =
+            Query::parse(r#"@search(@context matches "^home-.*$")"#).expect("query should parse");
         let mut tag_values = HashMap::new();
         tag_values.insert("context".to_string(), "home-office".to_string());
         let a = Action {
@@ -962,8 +980,8 @@ mod tests {
 
     #[test]
     fn taskpaper_search_supports_case_modifier_i() {
-        let q = Query::parse(r#"@search(@context contains[i] "HOME")"#)
-            .expect("query should parse");
+        let q =
+            Query::parse(r#"@search(@context contains[i] "HOME")"#).expect("query should parse");
         let mut tag_values = HashMap::new();
         tag_values.insert("context".to_string(), "home-office".to_string());
         let a = Action {
@@ -1041,11 +1059,7 @@ mod tests {
         };
         assert!(q.matches(&ok));
         let deeper = Action {
-            project_chain: vec![
-                "Work".to_string(),
-                "ClientA".to_string(),
-                "Ops".to_string(),
-            ],
+            project_chain: vec!["Work".to_string(), "ClientA".to_string(), "Ops".to_string()],
             project: Some("Ops".to_string()),
             ..ok.clone()
         };
@@ -1078,8 +1092,7 @@ mod tests {
 
     #[test]
     fn taskpaper_search_item_path_keyword_and_exclude() {
-        let q = Query::parse(r#"@search(path /Work/* and not path /Work/Archive)"#)
-            .expect("parse");
+        let q = Query::parse(r#"@search(path /Work/* and not path /Work/Archive)"#).expect("parse");
         let active = Action {
             text: "t".to_string(),
             line_index: 0,
@@ -1113,7 +1126,8 @@ mod tests {
         let content = "Inbox:\n\t- First @na\n\t- Second @na\n\t- Third @na @done(2025-01-01)\n";
         fs::write(&path, content).expect("write temp taskpaper");
         let file = TodoFile::load(&path).expect("load");
-        let q = Query::parse(r#"@search((project Inbox and @na and not @done)[0])"#).expect("parse");
+        let q =
+            Query::parse(r#"@search((project Inbox and @na and not @done)[0])"#).expect("parse");
         let actions = evaluate_query(&[file], &q);
         fs::remove_file(&path).ok();
         assert_eq!(actions.len(), 1);
@@ -1132,7 +1146,8 @@ mod tests {
         let content = "Inbox:\n\t- First @na\n\t- Second @na\n\t- Third @na @done(2025-01-01)\n";
         fs::write(&path, content).expect("write");
         let file = TodoFile::load(&path).expect("load");
-        let q = Query::parse(r#"@search((project Inbox and @na and not @done)[0:2])"#).expect("parse");
+        let q =
+            Query::parse(r#"@search((project Inbox and @na and not @done)[0:2])"#).expect("parse");
         let actions = evaluate_query(&[file], &q);
         fs::remove_file(&path).ok();
         assert_eq!(actions.len(), 2);

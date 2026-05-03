@@ -14,6 +14,12 @@
       "name": "exclude done search",
       "fixture": "base.taskpaper",
       "query": "@search(not @done)"
+    },
+    {
+      "name": "find times compact",
+      "fixture": "timed.taskpaper",
+      "query": "@na",
+      "args": ["--times", "--done"]
     }
   ]
 }

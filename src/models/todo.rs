@@ -1,5 +1,7 @@
 use crate::io::fs::backup_path;
 use crate::models::action::Action;
+#[cfg(test)]
+use crate::parser::search::Query;
 use crate::parser::taskpaper::{extract_actions, render_lines};
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -7,8 +9,6 @@ use regex::Regex;
 use std::collections::HashSet;
 use std::fs;
 use std::path::{Path, PathBuf};
-#[cfg(test)]
-use crate::parser::search::Query;
 
 #[derive(Debug, Clone)]
 pub struct TodoFile {
@@ -91,7 +91,8 @@ impl TodoFile {
             .iter()
             .position(|line| line.trim() == header)
             .unwrap_or_else(|| {
-                if !self.lines.is_empty() && !self.lines.last().is_some_and(|l| l.trim().is_empty()) {
+                if !self.lines.is_empty() && !self.lines.last().is_some_and(|l| l.trim().is_empty())
+                {
                     self.lines.push(String::new());
                 }
                 self.lines.push(header.clone());
@@ -208,7 +209,10 @@ impl TodoFile {
                     text.push_str(tag);
                 }
             }
-            let mut project = action.project.clone().unwrap_or_else(|| "Inbox".to_string());
+            let mut project = action
+                .project
+                .clone()
+                .unwrap_or_else(|| "Inbox".to_string());
             if mutation.restore
                 && action
                     .project_chain
@@ -230,7 +234,12 @@ impl TodoFile {
             notes.retain(|n| !n.trim().is_empty());
 
             self.lines.drain(start..end);
-            self.add_action(Some(&project), &text, &notes, mutation.append_to_project_end);
+            self.add_action(
+                Some(&project),
+                &text,
+                &notes,
+                mutation.append_to_project_end,
+            );
             changed += 1;
         }
         if changed > 0 {
@@ -299,7 +308,8 @@ impl TodoFile {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("Failed creating backup dir {:?}", parent))?;
             }
-            fs::copy(&self.path, &backup).with_context(|| format!("Failed writing backup {:?}", backup))?;
+            fs::copy(&self.path, &backup)
+                .with_context(|| format!("Failed writing backup {:?}", backup))?;
         }
         fs::write(&self.path, render_lines(&self.lines))?;
         Ok(())
@@ -344,7 +354,10 @@ fn project_block_end(lines: &[String], project_idx: usize) -> usize {
     while idx < lines.len() {
         let line = lines[idx].as_str();
         let trimmed = line.trim();
-        if !trimmed.is_empty() && trimmed.ends_with(':') && leading_whitespace(line) <= project_indent {
+        if !trimmed.is_empty()
+            && trimmed.ends_with(':')
+            && leading_whitespace(line) <= project_indent
+        {
             break;
         }
         idx += 1;
@@ -421,7 +434,12 @@ mod tests {
         let query = Query::parse("Keep").expect("query should parse");
         let backup = backup_path(&path);
         let changed = todo
-            .apply_update(&query, &["@today".to_string()], &["@home".to_string(), "@priority".to_string()], false)
+            .apply_update(
+                &query,
+                &["@today".to_string()],
+                &["@home".to_string(), "@priority".to_string()],
+                false,
+            )
             .expect("update should apply");
         let updated = fs::read_to_string(&path).expect("updated file should read");
         fs::remove_file(path).ok();
@@ -492,8 +510,14 @@ mod tests {
         fs::remove_file(path).ok();
         fs::remove_file(backup).ok();
         assert_eq!(moved, 2);
-        assert!(updated.contains("Archive:\n- Ship thing @na @done("), "{updated}");
-        assert!(updated.contains("- Already done @done(2026-01-01 12:00)"), "{updated}");
+        assert!(
+            updated.contains("Archive:\n- Ship thing @na @done("),
+            "{updated}"
+        );
+        assert!(
+            updated.contains("- Already done @done(2026-01-01 12:00)"),
+            "{updated}"
+        );
         assert!(!updated.contains("Work:\n- Ship thing"), "{updated}");
     }
 }

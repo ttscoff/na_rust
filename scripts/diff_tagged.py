@@ -1,23 +1,25 @@
 #!/usr/bin/env python3
+"""Diff Ruby and Rust `na tagged` outputs (same flags as find + time modes)."""
 import argparse
 import json
 import os
 import re
+import shutil
 import subprocess
 import sys
+import tempfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import List
 
 
 @dataclass
 class Scenario:
     name: str
     fixture: str
-    args: List[str]
-    ruby_args: List[str]
-    rust_args: List[str]
+    tags: List[str]
+    extra_args: List[str]
 
 
 @dataclass
@@ -29,32 +31,22 @@ class RunResult:
 
 def read_scenarios(path: Path) -> List[Scenario]:
     payload = json.loads(path.read_text(encoding="utf-8"))
-    scenarios = []
+    out = []
     for item in payload.get("scenarios", []):
-        scenarios.append(
+        tags = item.get("tags")
+        if tags is None:
+            tags = item.get("tag", [])
+            if isinstance(tags, str):
+                tags = [tags]
+        out.append(
             Scenario(
                 name=item["name"],
                 fixture=item["fixture"],
-                args=item.get("args", []),
-                ruby_args=item.get("ruby_args", []),
-                rust_args=item.get("rust_args", []),
+                tags=list(tags),
+                extra_args=item.get("args", []),
             )
         )
-    return scenarios
-
-
-def run_cmd(command: List[str], cwd: Path) -> RunResult:
-    env = os.environ.copy()
-    env.setdefault("TZ", "UTC")
-    proc = subprocess.run(
-        command,
-        cwd=str(cwd),
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        text=True,
-        env=env,
-    )
-    return RunResult(proc.returncode, normalize(proc.stdout), normalize(proc.stderr))
+    return out
 
 
 def normalize(text: str) -> str:
@@ -62,7 +54,6 @@ def normalize(text: str) -> str:
 
 
 def normalize_times_line_spacing(text: str) -> str:
-    """Ruby multi_file template uses two spaces after the line number; Rust uses one."""
     lines = []
     for line in text.split("\n"):
         lines.append(re.sub(r"(\]\s*:\d+)\s{2,}", r"\1 ", line))
@@ -70,7 +61,6 @@ def normalize_times_line_spacing(text: str) -> str:
 
 
 def normalize_json_times_stdout(text: str) -> str:
-    """Canonicalize ISO timestamps in --json-times output for timezone-agnostic diff."""
     try:
         data = json.loads(text)
     except json.JSONDecodeError:
@@ -91,69 +81,47 @@ def normalize_json_times_stdout(text: str) -> str:
     return json.dumps(data, indent=2, sort_keys=True)
 
 
-_NEST_HEADER_LINE = re.compile(r"^(.+):(\d+):\s*$")
-
-
-def normalize_nest_headers(stdout: str, fixture_resolved: Path) -> str:
-    """Replace absolute/`~` paths in Ruby-style `path:line:` nest banners with FIXTURE:line:."""
-    want = fixture_resolved.resolve()
-    lines_out = []
-    for line in stdout.split("\n"):
-        m = _NEST_HEADER_LINE.match(line)
-        if m:
-            raw_path = m.group(1)
-            try:
-                cand = Path(raw_path).expanduser().resolve()
-            except OSError:
-                cand = None
-            if cand == want:
-                lines_out.append(f"FIXTURE:{m.group(2)}:")
-                continue
-        lines_out.append(line)
-    return "\n".join(lines_out)
-
-
-def postprocess_stdout_for_compare(
-    stdout: str,
-    effective_args: List[str],
-    fixture_path: Optional[Path] = None,
-) -> str:
-    if "--json-times" in effective_args:
+def postprocess_tagged_stdout(stdout: str, extra_args: List[str]) -> str:
+    if "--json-times" in extra_args:
         return normalize_json_times_stdout(stdout)
-    out = normalize_times_line_spacing(stdout)
-    if fixture_path is not None and (
-        "--nest" in effective_args or "--omnifocus" in effective_args
-    ):
-        out = normalize_nest_headers(out, fixture_path)
-    return out
+    return normalize_times_line_spacing(stdout)
 
 
-def render_report_line(ok: bool, scenario: Scenario) -> str:
-    status = "PASS" if ok else "FAIL"
-    return f"[{status}] {scenario.name}"
+def run_cmd(command: List[str], cwd: Path) -> RunResult:
+    env = os.environ.copy()
+    env.setdefault("TZ", "UTC")
+    proc = subprocess.run(
+        command,
+        cwd=str(cwd),
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        text=True,
+        env=env,
+    )
+    return RunResult(proc.returncode, normalize(proc.stdout), normalize(proc.stderr))
 
 
 def main() -> int:
-    parser = argparse.ArgumentParser(description="Diff Ruby and Rust `na next` outputs.")
+    parser = argparse.ArgumentParser(description="Diff Ruby and Rust `na tagged` outputs.")
     parser.add_argument(
         "--ruby-na",
         default=os.path.expanduser("~/Desktop/Code/na_gem/bin/na"),
-        help="Path to Ruby na executable (default: ~/Desktop/Code/na_gem/bin/na)",
+        help="Path to Ruby na executable",
     )
     parser.add_argument(
         "--rust-na",
         default="./target/debug/na",
-        help="Path to Rust na executable (default: ./target/debug/na)",
+        help="Path to Rust na executable",
     )
     parser.add_argument(
         "--fixtures",
-        default="fixtures/next",
-        help="Directory containing taskpaper fixture files (default: fixtures/next)",
+        default="fixtures/tagged",
+        help="Directory containing taskpaper fixture files",
     )
     parser.add_argument(
         "--scenarios",
-        default="fixtures/next/scenarios.json",
-        help="Scenario JSON file (default: fixtures/next/scenarios.json)",
+        default="fixtures/tagged/scenarios.json",
+        help="Scenario JSON file",
     )
     args = parser.parse_args()
 
@@ -185,7 +153,7 @@ def main() -> int:
         return 2
 
     failures = 0
-    print(f"Running {len(scenarios)} next scenario(s)")
+    print(f"Running {len(scenarios)} tagged scenario(s)")
     for scenario in scenarios:
         fixture_path = (fixture_dir / scenario.fixture).resolve()
         if not fixture_path.exists():
@@ -193,26 +161,24 @@ def main() -> int:
             failures += 1
             continue
 
-        effective_ruby_args = scenario.ruby_args or scenario.args
-        effective_rust_args = scenario.rust_args or scenario.args
-        ruby_args = ["next", "--file", str(fixture_path)] + effective_ruby_args
-        rust_args = ["next", "--file", str(fixture_path)] + effective_rust_args
-        ruby_result = run_cmd([str(ruby_na)] + ruby_args, repo_root)
-        rust_result = run_cmd([str(rust_na)] + rust_args, repo_root)
+        with tempfile.TemporaryDirectory(prefix="na_rust_diff_tagged_") as tmp:
+            tmp_path = Path(tmp)
+            tmp_fixture = tmp_path / "case.taskpaper"
+            shutil.copy2(fixture_path, tmp_fixture)
+            ruby_cmd = [str(ruby_na), "tagged"] + scenario.extra_args + scenario.tags
+            rust_cmd = [str(rust_na), "tagged"] + scenario.extra_args + scenario.tags
+            ruby_result = run_cmd(ruby_cmd, tmp_path)
+            rust_result = run_cmd(rust_cmd, tmp_path)
 
-        cmp_args = list(dict.fromkeys(effective_ruby_args + effective_rust_args))
-        ruby_out = postprocess_stdout_for_compare(
-            ruby_result.stdout, cmp_args, fixture_path
-        )
-        rust_out = postprocess_stdout_for_compare(
-            rust_result.stdout, cmp_args, fixture_path
-        )
+        ruby_out = postprocess_tagged_stdout(ruby_result.stdout, scenario.extra_args)
+        rust_out = postprocess_tagged_stdout(rust_result.stdout, scenario.extra_args)
 
-        same_exit = ruby_result.exit_code == rust_result.exit_code
-        same_stdout = ruby_out == rust_out
-        same_stderr = ruby_result.stderr == rust_result.stderr
-        ok = same_exit and same_stdout and same_stderr
-        print(render_report_line(ok, scenario))
+        ok = (
+            ruby_result.exit_code == rust_result.exit_code
+            and ruby_out == rust_out
+            and ruby_result.stderr == rust_result.stderr
+        )
+        print(f"[{'PASS' if ok else 'FAIL'}] {scenario.name}")
         if not ok:
             failures += 1
             print("  ruby:")

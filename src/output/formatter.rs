@@ -51,8 +51,7 @@ pub fn strip_na_token(text: String, na_tag: &str) -> String {
 pub(crate) fn strip_ansi_measurement(input: &str) -> String {
     static CSI: OnceLock<Regex> = OnceLock::new();
     let csi = CSI.get_or_init(|| {
-        Regex::new(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]")
-            .expect("csi strip regex")
+        Regex::new(r"\x1b\[[\x30-\x3f]*[\x20-\x2f]*[\x40-\x7e]").expect("csi strip regex")
     });
     let s = csi.replace_all(input, "").to_string();
     static OSC: OnceLock<Regex> = OnceLock::new();
@@ -108,11 +107,7 @@ pub(crate) fn wrap_words(input: &str, width: usize) -> Vec<String> {
 }
 
 pub(crate) fn paint_themed(text: &str, template: &str) -> String {
-    format!(
-        "{}{}\x1b[0m",
-        expand_color_template(template),
-        text
-    )
+    format!("{}{}\x1b[0m", expand_color_template(template), text)
 }
 
 /// Flat-line layout: Rust-style (`%filename%`, …) and Ruby-style (`%filename`, `%line`, …) tokens.
@@ -228,7 +223,12 @@ fn substitute_output_template(
 
 /// Ruby `String#highlight_tags` + leading `template[:action]` color: `@name`, `(` `)` and value use
 /// separate theme slots; action color resumes after each tag.
-pub(crate) fn color_action_body(body: &str, _tags: &[String], style_color: bool, theme: &Theme) -> String {
+pub(crate) fn color_action_body(
+    body: &str,
+    _tags: &[String],
+    style_color: bool,
+    theme: &Theme,
+) -> String {
     if !style_color {
         return body.to_string();
     }
@@ -293,15 +293,6 @@ pub(crate) fn nested_bracketed_chain(chain: &str, style_color: bool, theme: &The
         paint_themed(chain, &theme.parent),
         paint_themed("]", &theme.bracket),
     )
-}
-
-/// One nested file-group header (`path:`) using the filename color template when enabled.
-pub(crate) fn nested_file_title(display: &str, style_color: bool, theme: &Theme) -> String {
-    if !style_color {
-        format!("{display}:")
-    } else {
-        paint_themed(&format!("{display}:"), &theme.filename)
-    }
 }
 
 /// Format one action line using `theme.flat_action_template(...)`:
@@ -470,8 +461,8 @@ pub fn format_action(
 #[cfg(test)]
 mod tests {
     use super::{format_action, strip_na_token, OutputStyle};
-    use crate::output::theme::Theme;
     use crate::models::action::Action;
+    use crate::output::theme::Theme;
     use std::collections::HashMap;
 
     fn sample_action() -> Action {
@@ -591,10 +582,7 @@ mod tests {
             &theme,
             false,
         );
-        assert_eq!(
-            out,
-            ":4 [ProjectA] Draft report @priority(5)"
-        );
+        assert_eq!(out, ":4 [ProjectA] Draft report @priority(5)");
     }
 
     #[test]
@@ -680,7 +668,10 @@ mod tests {
             &theme,
             false,
         );
-        assert!(out.contains("\x1b[35m"), "magenta bracket template: {out:?}");
+        assert!(
+            out.contains("\x1b[35m"),
+            "magenta bracket template: {out:?}"
+        );
         assert!(out.contains("\x1b[36m"), "cyan parent template: {out:?}");
     }
 
@@ -689,14 +680,6 @@ mod tests {
         assert_eq!(
             super::nested_bracketed_chain("Work/A", false, &Theme::default()),
             "[Work/A]"
-        );
-    }
-
-    #[test]
-    fn nested_file_title_plain() {
-        assert_eq!(
-            super::nested_file_title("todo.taskpaper", false, &Theme::default()),
-            "todo.taskpaper:"
         );
     }
 

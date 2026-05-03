@@ -19,6 +19,41 @@
         "@search(@context contains \"office\")",
         "--available"
       ]
+    },
+    {
+      "name": "next only-times (markdown totals)",
+      "fixture": "timed.taskpaper",
+      "args": ["--only-times", "--done"]
+    },
+    {
+      "name": "next json-times",
+      "fixture": "timed.taskpaper",
+      "args": ["--json-times"]
+    },
+    {
+      "name": "next only-timed with durations",
+      "fixture": "timed.taskpaper",
+      "args": ["--only-timed", "--done"]
+    },
+    {
+      "name": "next times compact",
+      "fixture": "timed.taskpaper",
+      "args": ["--times", "--done"]
+    },
+    {
+      "name": "next times human",
+      "fixture": "timed.taskpaper",
+      "args": ["--times", "--human", "--done"]
+    },
+    {
+      "name": "next nest list",
+      "fixture": "base.taskpaper",
+      "args": ["--nest"]
+    },
+    {
+      "name": "next omnifocus list",
+      "fixture": "base.taskpaper",
+      "args": ["--omnifocus"]
     }
   ]
 }

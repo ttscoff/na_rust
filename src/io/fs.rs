@@ -75,8 +75,8 @@ mod tests {
     use crate::io::xdg::TEST_ENV_MUTEX;
     use std::fs;
     use std::path::{Path, PathBuf};
-    use std::sync::{Mutex, OnceLock};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -122,20 +122,23 @@ mod tests {
         fs::create_dir_all(root.join("nested").join("deep")).expect("fixture dir should create");
         fs::create_dir_all(root.join(".hidden")).expect("hidden fixture dir should create");
         fs::write(root.join("root.taskpaper"), "Inbox:\n").expect("root fixture write");
-        fs::write(root.join("nested").join("deep").join("deep.taskpaper"), "Inbox:\n")
-            .expect("deep fixture write");
+        fs::write(
+            root.join("nested").join("deep").join("deep.taskpaper"),
+            "Inbox:\n",
+        )
+        .expect("deep fixture write");
         fs::write(root.join(".hidden").join("hidden.taskpaper"), "Inbox:\n")
             .expect("hidden fixture write");
 
         let old_cwd = std::env::current_dir().expect("cwd should resolve");
         std::env::set_current_dir(&root).expect("fixture cwd should change");
 
-        let shallow =
-            discover_taskpaper_files_with_options("taskpaper", 2, false).expect("discover should work");
-        let deep =
-            discover_taskpaper_files_with_options("taskpaper", 5, false).expect("discover should work");
-        let with_hidden =
-            discover_taskpaper_files_with_options("taskpaper", 5, true).expect("discover should work");
+        let shallow = discover_taskpaper_files_with_options("taskpaper", 2, false)
+            .expect("discover should work");
+        let deep = discover_taskpaper_files_with_options("taskpaper", 5, false)
+            .expect("discover should work");
+        let with_hidden = discover_taskpaper_files_with_options("taskpaper", 5, true)
+            .expect("discover should work");
 
         std::env::set_current_dir(old_cwd).expect("cwd should restore");
         fs::remove_dir_all(root).ok();
@@ -160,8 +163,8 @@ mod tests {
 
         let old_cwd = std::env::current_dir().expect("cwd should resolve");
         std::env::set_current_dir(&root).expect("fixture cwd should change");
-        let files =
-            discover_taskpaper_files_with_options("taskpaper", 3, false).expect("discover should work");
+        let files = discover_taskpaper_files_with_options("taskpaper", 3, false)
+            .expect("discover should work");
         std::env::set_current_dir(old_cwd).expect("cwd should restore");
         fs::remove_dir_all(root).ok();
 
