@@ -14,7 +14,7 @@ pub struct Cli {
     pub version: bool,
 
     /// Override file extension when searching for TaskPaper files.
-    #[arg(short, long, default_value = "taskpaper")]
+    #[arg(short, long, visible_alias = "ext", default_value = "taskpaper")]
     pub extension: String,
 
     /// Work against a single global file instead of cwd scanning.
@@ -91,7 +91,7 @@ pub struct NextArgs {
     pub filter: Option<String>,
 
     /// Keep only one action per project.
-    #[arg(long = "first-available", visible_alias = "available", default_value_t = false)]
+    #[arg(short = 'a', long = "first-available", visible_alias = "available", default_value_t = false)]
     pub first_available: bool,
 
     /// Display matches from a specific TaskPaper file.
@@ -311,6 +311,18 @@ pub struct FindArgs {
     #[arg(long, default_value_t = false)]
     pub human: bool,
 
+    /// Show only actions with both @started and @done.
+    #[arg(long = "only-timed", default_value_t = false)]
+    pub only_timed: bool,
+
+    /// Output times as JSON object (implies including done actions; same schema as `next`).
+    #[arg(long = "json-times", default_value_t = false)]
+    pub json_times: bool,
+
+    /// Output only the duration summary (markdown table / total).
+    #[arg(long = "only-times", default_value_t = false)]
+    pub only_times: bool,
+
     /// Run plugin on resulting actions.
     #[arg(long, value_name = "NAME")]
     pub plugin: Option<String>,
@@ -411,7 +423,7 @@ pub struct AddArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct UpdateArgs {
-    /// Optional search query for selecting actions.
+    /// Search query: `@search(...)`, keywords, or **`PATH:LINE`** (1-based line, same as interactive menus).
     #[arg(value_name = "QUERY")]
     pub query: Option<String>,
 
@@ -420,11 +432,11 @@ pub struct UpdateArgs {
     pub tag: Vec<String>,
 
     /// Tags to remove (e.g. @today @home).
-    #[arg(long, visible_alias = "remove", value_name = "TAG", num_args = 0..)]
+    #[arg(short = 'r', long, visible_alias = "remove", value_name = "TAG", num_args = 0..)]
     pub untag: Vec<String>,
 
     /// Mark action as done.
-    #[arg(long, visible_alias = "finish", default_value_t = false)]
+    #[arg(short = 'f', long = "finish", visible_alias = "done", default_value_t = false)]
     pub done: bool,
 
     /// Restrict updates to a specific file path.
@@ -495,6 +507,10 @@ pub struct UpdateArgs {
     #[arg(long = "edit", default_value_t = false)]
     pub edit: bool,
 
+    /// Editor for `--edit` (overrides `NA_EDITOR`, then `GIT_EDITOR`, then `EDITOR`).
+    #[arg(long = "editor", value_name = "EDITOR")]
+    pub editor: Option<String>,
+
     /// Delete selected actions.
     #[arg(long, default_value_t = false)]
     pub delete: bool,
@@ -508,7 +524,7 @@ pub struct UpdateArgs {
     pub note: Vec<String>,
 
     /// Replace existing notes instead of appending.
-    #[arg(long = "overwrite-notes", default_value_t = false)]
+    #[arg(short = 'o', long = "overwrite-notes", visible_alias = "overwrite", default_value_t = false)]
     pub overwrite_notes: bool,
 
     /// Set started timestamp token.
@@ -672,6 +688,10 @@ pub struct CompletedArgs {
     #[arg(long, default_value_t = false)]
     pub omnifocus: bool,
 
+    /// Omit filename in output (same semantics as `find --no-file`).
+    #[arg(long = "no-file", default_value_t = false)]
+    pub no_file: bool,
+
     /// Save this completed query.
     #[arg(long, value_name = "TITLE")]
     pub save: Option<String>,
@@ -788,7 +808,7 @@ pub enum PluginCommands {
 pub struct MoveArgs {
     #[arg(value_name = "QUERY")]
     pub query: Option<String>,
-    #[arg(long = "to", value_name = "PROJECT")]
+    #[arg(long = "to", visible_alias = "move", value_name = "PROJECT")]
     pub to: String,
     #[arg(long = "at", value_name = "POSITION")]
     pub at: Option<String>,
@@ -911,6 +931,22 @@ mod tests {
             Some(Commands::Next(args)) => assert!(args.first_available),
             _ => panic!("expected next command"),
         }
+    }
+
+    #[test]
+    fn next_short_a_sets_first_available() {
+        let cli = Cli::parse_from(["na", "next", "-a"]);
+        match cli.command {
+            Some(Commands::Next(args)) => assert!(args.first_available),
+            _ => panic!("expected next command"),
+        }
+    }
+
+    #[test]
+    fn global_ext_alias_parses() {
+        let cli = Cli::parse_from(["na", "--ext", "tp", "next"]);
+        assert_eq!(cli.extension.as_str(), "tp");
+        assert!(matches!(cli.command, Some(Commands::Next(_))));
     }
 
     #[test]
@@ -1061,6 +1097,76 @@ mod tests {
     }
 
     #[test]
+    fn update_short_r_f_o_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "update",
+            "-r",
+            "@na",
+            "-f",
+            "-o",
+            "--all",
+            "needle",
+        ]);
+        match cli.command {
+            Some(Commands::Update(args)) => {
+                assert_eq!(args.untag, vec!["@na".to_string()]);
+                assert!(args.done);
+                assert!(args.overwrite_notes);
+                assert!(args.all);
+                assert_eq!(args.query.as_deref(), Some("needle"));
+            }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
+    fn update_overwrite_visible_alias_parses() {
+        let cli = Cli::parse_from(["na", "update", "--overwrite", "--all", "q"]);
+        match cli.command {
+            Some(Commands::Update(args)) => {
+                assert!(args.overwrite_notes);
+                assert!(args.all);
+            }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
+    fn move_to_visible_alias_move_parses() {
+        let cli = Cli::parse_from(["na", "move", "find me", "--move", "Bugs"]);
+        match cli.command {
+            Some(Commands::Move(args)) => {
+                assert_eq!(args.query.as_deref(), Some("find me"));
+                assert_eq!(args.to.as_str(), "Bugs");
+            }
+            _ => panic!("expected move"),
+        }
+    }
+
+    #[test]
+    fn update_editor_flag_parses() {
+        let cli = Cli::parse_from([
+            "na",
+            "update",
+            "--editor",
+            "nano",
+            "--edit",
+            "--all",
+            "needle",
+        ]);
+        match cli.command {
+            Some(Commands::Update(args)) => {
+                assert_eq!(args.editor.as_deref(), Some("nano"));
+                assert!(args.edit);
+                assert!(args.all);
+                assert_eq!(args.query.as_deref(), Some("needle"));
+            }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
     fn edit_flags_parse() {
         let cli = Cli::parse_from([
             "na",
@@ -1151,6 +1257,15 @@ mod tests {
                 assert_eq!(args.pattern, vec!["feature".to_string()]);
             }
             _ => panic!("expected completed via finished alias"),
+        }
+    }
+
+    #[test]
+    fn completed_no_file_parses() {
+        let cli = Cli::parse_from(["na", "completed", "--no-file"]);
+        match cli.command {
+            Some(Commands::Completed(args)) => assert!(args.no_file),
+            _ => panic!("expected completed"),
         }
     }
 

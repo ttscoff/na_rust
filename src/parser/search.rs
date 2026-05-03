@@ -1,11 +1,24 @@
 use crate::models::action::Action;
 use crate::models::todo::TodoFile;
+use crate::parser::item_path::{parse_item_path, project_chain_matches_path};
 use anyhow::Result;
+use std::collections::HashSet;
 
 #[derive(Debug, Clone, Default)]
 pub struct Query {
     clauses: Vec<Clause>,
     include_done: bool,
+    /// Trailing `[n]` or `[a:b]` on the `@search(...)` inner expression (applied per OR clause).
+    slice: Option<SearchSlice>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SearchSlice {
+    Index(isize),
+    Range {
+        start: Option<usize>,
+        end: Option<usize>,
+    },
 }
 
 #[derive(Debug, Clone, Default)]
@@ -16,6 +29,9 @@ struct Clause {
     comparisons: Vec<TagComparison>,
     project: Option<String>,
     exclude_projects: Vec<String>,
+    /// Slash item path (`/A/B`, `//X`, `/A/*/B`), same semantics as add/update `project`.
+    item_path: Option<String>,
+    exclude_item_paths: Vec<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -54,6 +70,7 @@ impl Query {
         Ok(Self {
             clauses: vec![clause],
             include_done,
+            slice: None,
         })
     }
 
@@ -65,9 +82,12 @@ impl Query {
                 comparisons: Vec::new(),
                 project: None,
                 exclude_projects: Vec::new(),
+                item_path: None,
+                exclude_item_paths: Vec::new(),
                 terms: Vec::new(),
             }],
             include_done: false,
+            slice: None,
         }
     }
 
@@ -89,66 +109,62 @@ impl Query {
             inner = stripped.trim();
         }
 
+        let (inner, slice) = split_trailing_slice(inner);
+
         let mut include_done = false;
-        let global_excludes = extract_global_not_project(inner);
+        let global_excludes = extract_global_not_project(&inner);
         let mut clauses = Vec::new();
-        for raw_clause in split_by_keyword(inner, "or") {
-            let mut clause = Clause::default();
-            clause.exclude_projects.extend(global_excludes.clone());
-            for part in split_by_keyword(raw_clause.trim(), "and") {
-                let predicate = part.trim();
+        for raw_clause in split_by_keyword(&inner, "or") {
+            let raw_clause = strip_wrapping_parens(raw_clause.trim());
+            let mut variants = vec![Clause {
+                exclude_projects: global_excludes.clone(),
+                ..Clause::default()
+            }];
+            for part in split_by_keyword(raw_clause, "and") {
+                let predicate = strip_wrapping_parens(part.trim());
                 if predicate.is_empty() {
                     continue;
                 }
-                let mut negated = false;
-                let mut p = predicate;
-                if let Some(rest) = predicate.strip_prefix("not ") {
-                    negated = true;
-                    p = rest.trim();
-                }
-
-                if let Some(value) = parse_project_predicate(p) {
-                    if negated {
-                        clause.exclude_projects.push(value);
-                    } else {
-                        clause.project = Some(value);
+                let options: Vec<&str> = split_by_keyword(predicate, "or");
+                if options.len() <= 1 {
+                    for clause in &mut variants {
+                        apply_search_predicate(clause, predicate, &mut include_done);
                     }
                     continue;
                 }
-
-                if p.starts_with('@') {
-                    if let Some(comp) = parse_tag_comparison(p, negated) {
-                        if comp.tag.eq_ignore_ascii_case("done") {
-                            include_done = !negated;
-                        }
-                        clause.comparisons.push(comp);
-                        continue;
+                let mut expanded = Vec::new();
+                for clause in &variants {
+                    for option in &options {
+                        let mut cloned = clause.clone();
+                        apply_search_predicate(
+                            &mut cloned,
+                            strip_wrapping_parens(option.trim()),
+                            &mut include_done,
+                        );
+                        expanded.push(cloned);
                     }
-                    if p.eq_ignore_ascii_case("@done") {
-                        include_done = !negated;
-                    }
-                    if negated {
-                        clause.negated_tags.push(p.to_string());
-                    } else {
-                        clause.tags.push(p.to_string());
-                    }
-                    continue;
                 }
-
-                clause.terms.push(strip_quotes(p).to_lowercase());
+                variants = expanded;
             }
-            clauses.push(clause);
+            clauses.extend(variants);
         }
 
         Ok(Self {
             clauses,
             include_done,
+            slice,
         })
     }
 
     fn matches_clause(clause: &Clause, action: &Action) -> bool {
         let action_lc = action.text.to_lowercase();
-        let terms_ok = clause.terms.iter().all(|term| action_lc.contains(term));
+        let terms_ok = clause.terms.iter().all(|term| {
+            if term.contains('*') {
+                glob_star_ordered_match(&action_lc, term)
+            } else {
+                action_lc.contains(term)
+            }
+        });
         let tags_ok = clause.tags.iter().all(|tag| action.has_tag(tag));
         let negated_tags_ok = clause.negated_tags.iter().all(|tag| !action.has_tag(tag));
         let comparisons_ok = clause.comparisons.iter().all(|cmp| {
@@ -170,7 +186,22 @@ impl Query {
             .iter()
             .all(|p| !project_predicate_matches_include(p.trim(), &project_names));
 
-        terms_ok && tags_ok && negated_tags_ok && comparisons_ok && project_ok && excluded_ok
+        let chain_owned: Vec<String> = project_names.iter().map(|s| (*s).to_string()).collect();
+        let item_path_ok = clause.item_path.as_ref().is_none_or(|path| {
+            project_chain_matches_path(&chain_owned, path.trim())
+        });
+        let item_path_excludes_ok = clause.exclude_item_paths.iter().all(|path| {
+            !project_chain_matches_path(&chain_owned, path.trim())
+        });
+
+        terms_ok
+            && tags_ok
+            && negated_tags_ok
+            && comparisons_ok
+            && project_ok
+            && excluded_ok
+            && item_path_ok
+            && item_path_excludes_ok
     }
 
     pub fn matches(&self, action: &Action) -> bool {
@@ -183,12 +214,152 @@ impl Query {
     }
 }
 
+fn apply_search_predicate(clause: &mut Clause, predicate: &str, include_done: &mut bool) {
+    let mut negated = false;
+    let mut p = predicate;
+    if let Some(rest) = predicate.strip_prefix("not ") {
+        negated = true;
+        p = rest.trim();
+    }
+    if let Some(value) = parse_project_predicate(p) {
+        if negated {
+            clause.exclude_projects.push(value);
+        } else {
+            clause.project = Some(value);
+        }
+        return;
+    }
+
+    if let Some(path) = parse_item_path_predicate(p) {
+        if negated {
+            clause.exclude_item_paths.push(path);
+        } else {
+            clause.item_path = Some(path);
+        }
+        return;
+    }
+
+    if p.starts_with('@') {
+        if let Some(comp) = parse_tag_comparison(p, negated) {
+            if comp.tag.eq_ignore_ascii_case("done") {
+                *include_done = !negated;
+            }
+            clause.comparisons.push(comp);
+            return;
+        }
+        if p.eq_ignore_ascii_case("@done") {
+            *include_done = !negated;
+        }
+        if negated {
+            clause.negated_tags.push(p.to_string());
+        } else {
+            clause.tags.push(p.to_string());
+        }
+        return;
+    }
+    clause.terms.push(strip_quotes(p).to_lowercase());
+}
+
 pub fn evaluate_query(files: &[TodoFile], query: &Query) -> Vec<Action> {
-    files
-        .iter()
-        .flat_map(TodoFile::actions)
-        .filter(|a| (query.include_done || !a.done) && query.matches(a))
-        .collect()
+    match &query.slice {
+        None => files
+            .iter()
+            .flat_map(TodoFile::actions)
+            .filter(|a| (query.include_done || !a.done) && query.matches(a))
+            .collect(),
+        Some(slice) => {
+            let mut seen = HashSet::<String>::new();
+            let mut out = Vec::new();
+            for clause in &query.clauses {
+                let mut matched: Vec<Action> = files
+                    .iter()
+                    .flat_map(TodoFile::actions)
+                    .filter(|a| {
+                        (query.include_done || !a.done) && Query::matches_clause(clause, a)
+                    })
+                    .collect();
+                matched = apply_search_slice(matched, slice);
+                for a in matched {
+                    let key = format!("{}:{}", a.source_file, a.line_index);
+                    if seen.insert(key) {
+                        out.push(a);
+                    }
+                }
+            }
+            out
+        }
+    }
+}
+
+fn split_trailing_slice(inner: &str) -> (String, Option<SearchSlice>) {
+    let trimmed_end = inner.trim_end();
+    let Some(without_close) = trimmed_end.strip_suffix(']') else {
+        return (inner.to_string(), None);
+    };
+    let Some(open_bracket) = without_close.rfind('[') else {
+        return (inner.to_string(), None);
+    };
+    let slice_inner = without_close[open_bracket + 1..].trim();
+    if !slice_inner
+        .chars()
+        .all(|c| c.is_ascii_digit() || c == ':')
+    {
+        return (inner.to_string(), None);
+    }
+    let expr = without_close[..open_bracket].trim_end();
+    if expr.is_empty() {
+        return (inner.to_string(), None);
+    }
+    let Some(sl) = parse_slice_inner(slice_inner) else {
+        return (inner.to_string(), None);
+    };
+    (expr.trim().to_string(), Some(sl))
+}
+
+fn parse_slice_inner(s: &str) -> Option<SearchSlice> {
+    let s = s.trim();
+    if s.contains(':') {
+        let mut parts = s.splitn(2, ':');
+        let a = parts.next().unwrap_or("");
+        let b = parts.next().unwrap_or("");
+        let start = if a.is_empty() {
+            None
+        } else {
+            Some(a.parse::<usize>().ok()?)
+        };
+        let end = if b.is_empty() {
+            None
+        } else {
+            Some(b.parse::<usize>().ok()?)
+        };
+        Some(SearchSlice::Range { start, end })
+    } else if s.is_empty() {
+        None
+    } else {
+        Some(SearchSlice::Index(s.parse::<isize>().ok()?))
+    }
+}
+
+fn apply_search_slice(actions: Vec<Action>, slice: &SearchSlice) -> Vec<Action> {
+    match slice {
+        SearchSlice::Index(i) => {
+            if *i < 0 {
+                return Vec::new();
+            }
+            let i = *i as usize;
+            actions.get(i).cloned().into_iter().collect()
+        }
+        SearchSlice::Range { start, end } => {
+            let len = actions.len();
+            let s = start.unwrap_or(0).min(len);
+            let e = end.unwrap_or(len).min(len);
+            if s >= e {
+                Vec::new()
+            } else {
+                actions[s..e].to_vec()
+            }
+        }
+    }
 }
 
 fn parse_project_predicate(input: &str) -> Option<String> {
@@ -212,6 +383,21 @@ fn parse_project_predicate(input: &str) -> Option<String> {
         return None;
     }
     Some(strip_quotes(parts[1].trim()).to_string())
+}
+
+fn parse_item_path_predicate(input: &str) -> Option<String> {
+    let trimmed = input.trim();
+    if trimmed.starts_with('/') && !parse_item_path(trimmed).is_empty() {
+        return Some(trimmed.to_string());
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if lower.starts_with("path ") {
+        let rest = trimmed["path ".len()..].trim();
+        if rest.starts_with('/') && !parse_item_path(rest).is_empty() {
+            return Some(rest.to_string());
+        }
+    }
+    None
 }
 
 fn parse_tag_comparison(input: &str, negated: bool) -> Option<TagComparison> {
@@ -338,6 +524,48 @@ fn strip_quotes(input: &str) -> &str {
     }
 }
 
+fn strip_wrapping_parens(input: &str) -> &str {
+    let mut out = input.trim();
+    loop {
+        if !(out.starts_with('(') && out.ends_with(')')) {
+            return out;
+        }
+        let mut quote: Option<char> = None;
+        let mut depth = 0usize;
+        let mut wraps_whole = true;
+        for (i, ch) in out.char_indices() {
+            if let Some(q) = quote {
+                if ch == q {
+                    quote = None;
+                }
+                continue;
+            }
+            if ch == '"' || ch == '\'' {
+                quote = Some(ch);
+                continue;
+            }
+            if ch == '(' {
+                depth += 1;
+            } else if ch == ')' {
+                if depth == 0 {
+                    wraps_whole = false;
+                    break;
+                }
+                depth -= 1;
+                if depth == 0 && i + 1 < out.len() {
+                    wraps_whole = false;
+                    break;
+                }
+            }
+        }
+        if wraps_whole {
+            out = out[1..out.len() - 1].trim();
+        } else {
+            return out;
+        }
+    }
+}
+
 fn project_predicate_matches_include(pattern: &str, segments: &[&str]) -> bool {
     if pattern.is_empty() {
         return true;
@@ -379,6 +607,7 @@ fn split_by_keyword<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
     let mut out = Vec::new();
     let mut start = 0usize;
     let mut quote: Option<char> = None;
+    let mut paren_depth = 0usize;
     let mut idx = 0usize;
 
     while idx < input.len() {
@@ -395,8 +624,18 @@ fn split_by_keyword<'a>(input: &'a str, keyword: &str) -> Vec<&'a str> {
             idx += 1;
             continue;
         }
+        if ch == '(' {
+            paren_depth += 1;
+            idx += 1;
+            continue;
+        }
+        if ch == ')' {
+            paren_depth = paren_depth.saturating_sub(1);
+            idx += 1;
+            continue;
+        }
 
-        if input[idx..].to_lowercase().starts_with(&kw) {
+        if paren_depth == 0 && input[idx..].to_lowercase().starts_with(&kw) {
             out.push(input[start..idx].trim());
             idx += kw.len();
             start = idx;
@@ -431,6 +670,7 @@ fn extract_global_not_project(input: &str) -> Vec<String> {
 
 #[cfg(test)]
 mod tests {
+    use super::evaluate_query;
     use super::Query;
     use crate::models::action::Action;
     use std::collections::HashMap;
@@ -739,5 +979,182 @@ mod tests {
             source_file: "x.taskpaper".to_string(),
         };
         assert!(q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_respects_parenthesized_and_or_groups() {
+        let q = Query::parse(r#"@search((@home or @office) and not @done)"#)
+            .expect("query should parse");
+        let home = Action {
+            text: "Home task".to_string(),
+            line_index: 0,
+            project: Some("Inbox".to_string()),
+            project_chain: vec!["Inbox".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@home".to_string()],
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        let office_done = Action {
+            tags: vec!["@office".to_string(), "@done".to_string()],
+            done: true,
+            ..home.clone()
+        };
+        assert!(q.matches(&home));
+        assert!(!q.matches(&office_done));
+    }
+
+    #[test]
+    fn taskpaper_search_supports_wildcard_terms() {
+        let q = Query::parse(r#"@search(road*map)"#).expect("query should parse");
+        let a = Action {
+            text: "Road to final map".to_string(),
+            line_index: 0,
+            project: Some("Work".to_string()),
+            project_chain: vec!["Work".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@na".to_string()],
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_matches_slash_item_path() {
+        let q = Query::parse(r#"@search(/Work/ClientA)"#).expect("parse");
+        let ok = Action {
+            text: "t".to_string(),
+            line_index: 0,
+            project: Some("ClientA".to_string()),
+            project_chain: vec!["Work".to_string(), "ClientA".to_string()],
+            notes: Vec::new(),
+            tags: Vec::new(),
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&ok));
+        let deeper = Action {
+            project_chain: vec![
+                "Work".to_string(),
+                "ClientA".to_string(),
+                "Ops".to_string(),
+            ],
+            project: Some("Ops".to_string()),
+            ..ok.clone()
+        };
+        assert!(q.matches(&deeper));
+        let wrong = Action {
+            project_chain: vec!["Work".to_string(), "ClientB".to_string()],
+            project: Some("ClientB".to_string()),
+            ..ok.clone()
+        };
+        assert!(!q.matches(&wrong));
+    }
+
+    #[test]
+    fn taskpaper_search_matches_descendant_item_path_double_slash() {
+        let q = Query::parse(r#"@search(//Ops)"#).expect("parse");
+        let a = Action {
+            text: "t".to_string(),
+            line_index: 0,
+            project: Some("Ops".to_string()),
+            project_chain: vec!["Work".to_string(), "ClientA".to_string(), "Ops".to_string()],
+            notes: Vec::new(),
+            tags: Vec::new(),
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&a));
+    }
+
+    #[test]
+    fn taskpaper_search_item_path_keyword_and_exclude() {
+        let q = Query::parse(r#"@search(path /Work/* and not path /Work/Archive)"#)
+            .expect("parse");
+        let active = Action {
+            text: "t".to_string(),
+            line_index: 0,
+            project: Some("Team".to_string()),
+            project_chain: vec!["Work".to_string(), "Team".to_string()],
+            notes: Vec::new(),
+            tags: Vec::new(),
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "x.taskpaper".to_string(),
+        };
+        assert!(q.matches(&active));
+        let archived = Action {
+            project_chain: vec!["Work".to_string(), "Archive".to_string()],
+            project: Some("Archive".to_string()),
+            ..active.clone()
+        };
+        assert!(!q.matches(&archived));
+    }
+
+    #[test]
+    fn taskpaper_search_trailing_slice_index_returns_first_match() {
+        use crate::models::todo::TodoFile;
+        use std::fs;
+
+        let path = std::env::temp_dir().join(format!(
+            "na_search_slice_idx_{}.taskpaper",
+            std::process::id()
+        ));
+        let content = "Inbox:\n\t- First @na\n\t- Second @na\n\t- Third @na @done(2025-01-01)\n";
+        fs::write(&path, content).expect("write temp taskpaper");
+        let file = TodoFile::load(&path).expect("load");
+        let q = Query::parse(r#"@search((project Inbox and @na and not @done)[0])"#).expect("parse");
+        let actions = evaluate_query(&[file], &q);
+        fs::remove_file(&path).ok();
+        assert_eq!(actions.len(), 1);
+        assert!(actions[0].text.contains("First"), "{:?}", actions[0].text);
+    }
+
+    #[test]
+    fn taskpaper_search_trailing_slice_range_is_exclusive_end() {
+        use crate::models::todo::TodoFile;
+        use std::fs;
+
+        let path = std::env::temp_dir().join(format!(
+            "na_search_slice_range_{}.taskpaper",
+            std::process::id()
+        ));
+        let content = "Inbox:\n\t- First @na\n\t- Second @na\n\t- Third @na @done(2025-01-01)\n";
+        fs::write(&path, content).expect("write");
+        let file = TodoFile::load(&path).expect("load");
+        let q = Query::parse(r#"@search((project Inbox and @na and not @done)[0:2])"#).expect("parse");
+        let actions = evaluate_query(&[file], &q);
+        fs::remove_file(&path).ok();
+        assert_eq!(actions.len(), 2);
+        assert!(actions[0].text.contains("First"));
+        assert!(actions[1].text.contains("Second"));
+    }
+
+    #[test]
+    fn taskpaper_search_slice_negative_index_yields_no_results() {
+        use crate::models::todo::TodoFile;
+        use std::fs;
+
+        let path = std::env::temp_dir().join(format!(
+            "na_search_slice_neg_{}.taskpaper",
+            std::process::id()
+        ));
+        let content = "Inbox:\n\t- First @na\n";
+        fs::write(&path, content).expect("write");
+        let file = TodoFile::load(&path).expect("load");
+        let q = Query::parse(r#"@search((@na)[-1])"#).expect("parse");
+        let actions = evaluate_query(&[file], &q);
+        fs::remove_file(&path).ok();
+        assert!(actions.is_empty());
     }
 }

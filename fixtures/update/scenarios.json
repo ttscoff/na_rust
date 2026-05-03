@@ -4,6 +4,11 @@
       "name": "update add tag by query",
       "fixture": "base.taskpaper",
       "args": ["Ship feature", "--tag", "today", "--all"]
+    },
+    {
+      "name": "update path colon line selects row",
+      "fixture": "base.taskpaper",
+      "args": ["base.taskpaper:2", "--tag", "patched", "--all"]
     }
   ]
 }

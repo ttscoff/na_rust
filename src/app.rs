@@ -6,19 +6,30 @@ use crate::cli::{
 use crate::io::fs::{discover_taskpaper_files, discover_taskpaper_files_with_options};
 use crate::models::action::Action;
 use crate::models::todo::{TodoFile, UpdateMutation};
-use crate::output::formatter::{format_action, OutputStyle};
+use crate::output::duration::{
+    accumulate_timing_totals_by_tag, action_timing_window, format_ruby_duration,
+    render_duration_footer, serialize_json_times,
+};
+use crate::output::formatter::{
+    color_action_body, format_action, nested_bracketed_chain, nested_file_title, paint_themed,
+    visual_width_tabs8, wrap_words, OutputStyle,
+};
+use crate::output::theme::Theme;
+use crate::parser::item_path::resolve_item_path;
 use crate::parser::search::{evaluate_query, Query};
+use crate::parser::{expand_date_tags_in_line, parse_tag_datetime};
 use crate::io::xdg::{na_backup_dir, na_data_dir};
 use crate::plugins::format::{merge_plugin_stdout_into_actions, PluginDataFormat};
 use crate::plugins::registry::{PluginRegistry, PluginRunner};
 use anyhow::{Context, Result};
-use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
+use chrono::{DateTime, Utc};
 use inquire::{InquireError, MultiSelect, Select, Text};
-use std::collections::{HashMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::fs;
 use std::io::Read;
 use std::io::IsTerminal;
 use std::path::{Path, PathBuf};
+use std::sync::OnceLock;
 
 pub fn run(cli: Cli) -> Result<()> {
     if cli.version {
@@ -107,22 +118,40 @@ fn load_todo_files(cli: &Cli) -> Result<Vec<TodoFile>> {
         .collect()
 }
 
+#[derive(Clone, Copy)]
+struct TimeOutputFlags {
+    human: bool,
+    /// User passed `--times`: show action lines with `[DD:HH:MM:SS]` (or human) suffix when timed.
+    inline_times: bool,
+    only_times: bool,
+    json_times: bool,
+}
+
 fn run_next(cli: &Cli, args: &NextArgs) -> Result<()> {
     if let Some(title) = args.save.as_deref() {
         save_next_search(args, title)?;
     }
     let files = load_next_todo_files(cli, args)?;
     let mut display_actions = next_actions(&files, args)?;
-    if args.times || args.json_times || args.only_times {
-        return output_time_summary(&display_actions, args);
-    }
     if let Some(merged) = run_next_plugin_merge(args, &display_actions)? {
         display_actions = merged;
+    }
+    let wants_time_block = args.times || args.json_times || args.only_times;
+    if wants_time_block {
+        if args.json_times || !args.nest_for_display() {
+            return render_next_time_block(cli, args, &display_actions);
+        }
     }
     let style = OutputStyle {
         color: output_color_enabled(cli),
         na_tag: "na",
         include_notes: args.effective_notes(),
+        wrap_width: output_wrap_columns(cli),
+    };
+    let theme = if style.color {
+        Theme::load()
+    } else {
+        Theme::default()
     };
     let file_labels = if args.no_file {
         HashMap::new()
@@ -131,13 +160,13 @@ fn run_next(cli: &Cli, args: &NextArgs) -> Result<()> {
     };
 
     if args.nest_for_display() {
-        print_next_nested(args, style, &file_labels, &display_actions);
+        print_next_nested(args, style, &file_labels, &display_actions, &theme);
     } else {
         for action in &display_actions {
             let file_prefix = file_labels
                 .get(&action.source_file)
                 .map(String::as_str);
-            println!("{}", format_action(action, style, file_prefix));
+            println!("{}", format_action(action, style, file_prefix, &theme, args.no_file));
         }
     }
 
@@ -286,32 +315,210 @@ fn saved_search_slug(title: &str) -> String {
     out.trim_matches('_').to_string()
 }
 
+/// Nested `--nest` / `--omnifocus`: word-wrap body to `$COLUMNS` minus prefix visible width,
+/// including when colors are enabled (prefix may contain CSI from `[project]` brackets).
+fn print_nested_body_lines(
+    plain_body: &str,
+    first_line_prefix: &str,
+    style: OutputStyle,
+    theme: &Theme,
+    tags: &[String],
+    notes_hidden_marker: bool,
+    has_notes: bool,
+) {
+    let prefix_cols = visual_width_tabs8(first_line_prefix);
+    let flush_line = |i: usize, last_i: usize, chunk: &str| {
+        let mut out = if i == 0 {
+            format!(
+                "{}{}",
+                first_line_prefix,
+                color_action_body(chunk, tags, style.color, theme)
+            )
+        } else {
+            format!(
+                "{}{}",
+                " ".repeat(prefix_cols),
+                color_action_body(chunk, tags, style.color, theme)
+            )
+        };
+        if notes_hidden_marker && has_notes && i == last_i {
+            if style.color {
+                out.push_str(&paint_themed("*", &theme.note));
+            } else {
+                out.push('*');
+            }
+        }
+        println!("{}", out);
+    };
+
+    if let Some(cols) = style.wrap_width {
+        let avail = cols.saturating_sub(prefix_cols).max(12);
+        let chunks = wrap_words(plain_body, avail);
+        if chunks.is_empty() {
+            return;
+        }
+        let last_i = chunks.len() - 1;
+        for (i, chunk) in chunks.iter().enumerate() {
+            flush_line(i, last_i, chunk);
+        }
+    } else {
+        flush_line(0, 0, plain_body);
+    }
+}
+
+/// Ruby `NA.output_children`: append ` @tags(a,b-c)` for tags other than `due`, `flagged`, `done`
+/// (`na_gem/lib/na/actions.rb`). Values use `name-value` like `priority-5`.
+fn omnifocus_auxiliary_tags_suffix(action: &Action) -> String {
+    const EXCLUDED: &[&str] = &["due", "flagged", "done"];
+    let mut parts: Vec<String> = Vec::new();
+    let mut seen: HashSet<String> = HashSet::new();
+    for tag in &action.tags {
+        let base = tag
+            .strip_prefix('@')
+            .and_then(|s| s.split('(').next())
+            .unwrap_or(tag.as_str());
+        let key_lc = base.to_ascii_lowercase();
+        if EXCLUDED.iter().any(|e| *e == key_lc.as_str()) {
+            continue;
+        }
+        if !seen.insert(key_lc) {
+            continue;
+        }
+        let val = action
+            .tag_values
+            .get(&base.to_ascii_lowercase())
+            .map(String::as_str)
+            .unwrap_or("");
+        let segment = if val.is_empty() {
+            base.to_string()
+        } else {
+            format!("{base}-{val}")
+        };
+        parts.push(segment);
+    }
+    if parts.is_empty() {
+        String::new()
+    } else {
+        format!(" @tags({})", parts.join(","))
+    }
+}
+
 fn print_next_nested(
     args: &NextArgs,
     style: OutputStyle,
     file_labels: &HashMap<String, String>,
     matches: &[Action],
+    theme: &Theme,
 ) {
-    let by_file = group_actions_by_file(matches);
-    for (file, actions_in_file) in by_file {
-        println!("== {file}");
-        if args.omnifocus {
-            let by_proj = group_actions_by_project(&actions_in_file);
-            for (proj, acts) in by_proj {
-                println!("## {proj}");
-                for action in acts {
-                    let file_prefix = file_labels
-                        .get(&action.source_file)
-                        .map(String::as_str);
-                    println!("{}", format_action(action, style, file_prefix));
+    // Ruby `NA::Actions.output` nest mode: file headers and `\t- [#{parent}] #{action}` / omni `output_children`
+    // use **full** action text (see `na_gem/lib/na/actions.rb`). Flat `Action#pretty` alone strips `@na`.
+    #[derive(Default)]
+    struct OmniNode<'a> {
+        children: BTreeMap<String, OmniNode<'a>>,
+        actions: Vec<&'a Action>,
+    }
+
+    fn omni_insert<'a>(node: &mut OmniNode<'a>, chain: &[String], action: &'a Action) {
+        if chain.is_empty() {
+            node.actions.push(action);
+            return;
+        }
+        let (head, rest) = chain.split_first().expect("non-empty chain");
+        let child = node.children.entry(head.clone()).or_insert_with(OmniNode::default);
+        if rest.is_empty() {
+            child.actions.push(action);
+        } else {
+            omni_insert(child, rest, action);
+        }
+    }
+
+    fn print_omni_tree(node: &OmniNode<'_>, level: usize, style: OutputStyle, theme: &Theme) {
+        let indent = "\t".repeat(level);
+        for (name, child) in &node.children {
+            let header = if style.color {
+                format!(
+                    "{indent}{}",
+                    paint_themed(&format!("{name}:"), &theme.project)
+                )
+            } else {
+                format!("{indent}{name}:")
+            };
+            println!("{}", header);
+            print_omni_tree(child, level + 1, style, theme);
+        }
+        if !node.actions.is_empty() {
+            let line_indent = format!("{indent}\t");
+            for a in &node.actions {
+                let plain = format!(
+                    "{}{}",
+                    a.text,
+                    omnifocus_auxiliary_tags_suffix(a)
+                );
+                let lead = format!("{line_indent}- ");
+                print_nested_body_lines(
+                    &plain,
+                    &lead,
+                    style,
+                    theme,
+                    &a.tags,
+                    !style.include_notes,
+                    !a.notes.is_empty(),
+                );
+                if style.include_notes {
+                    for n in &a.notes {
+                        if style.color {
+                            println!(
+                                "{line_indent}\t{}",
+                                paint_themed(n, &theme.note)
+                            );
+                        } else {
+                            println!("{line_indent}\t{n}");
+                        }
+                    }
                 }
             }
+        }
+    }
+
+    let by_file = group_actions_by_file(matches);
+    for (file, actions_in_file) in by_file {
+        let display = file_labels
+            .get(&file)
+            .cloned()
+            .unwrap_or_else(|| file.clone());
+        let display = display.trim_start_matches("./").to_string();
+
+        println!("{}", nested_file_title(&display, style.color, theme));
+        if args.omnifocus {
+            let mut root = OmniNode::default();
+            for a in &actions_in_file {
+                omni_insert(&mut root, &a.project_chain, a);
+            }
+            print_omni_tree(&root, 0, style, theme);
         } else {
             for action in actions_in_file {
-                let file_prefix = file_labels
-                    .get(&action.source_file)
-                    .map(String::as_str);
-                println!("{}", format_action(action, style, file_prefix));
+                let chain = action.project_chain.join("/");
+                let bracket = nested_bracketed_chain(&chain, style.color, theme);
+                let plain = action.text.clone();
+                let lead = format!("\t- {bracket} ");
+                print_nested_body_lines(
+                    &plain,
+                    &lead,
+                    style,
+                    theme,
+                    &action.tags,
+                    !style.include_notes,
+                    !action.notes.is_empty(),
+                );
+                if style.include_notes {
+                    for note in &action.notes {
+                        if style.color {
+                            println!("\t\t{}", paint_themed(note, &theme.note));
+                        } else {
+                            println!("\t\t{note}");
+                        }
+                    }
+                }
             }
         }
     }
@@ -327,24 +534,6 @@ fn group_actions_by_file(actions: &[Action]) -> Vec<(String, Vec<&Action>)> {
             }
         }
         out.push((action.source_file.clone(), vec![action]));
-    }
-    out
-}
-
-fn group_actions_by_project<'a>(actions: &'a [&'a Action]) -> Vec<(String, Vec<&'a Action>)> {
-    let mut out: Vec<(String, Vec<&Action>)> = Vec::new();
-    for action in actions {
-        let proj = action
-            .project
-            .clone()
-            .unwrap_or_else(|| "(none)".to_string());
-        if let Some(last) = out.last_mut() {
-            if last.0 == proj {
-                last.1.push(*action);
-                continue;
-            }
-        }
-        out.push((proj, vec![*action]));
     }
     out
 }
@@ -401,7 +590,7 @@ fn next_actions(files: &[TodoFile], args: &NextArgs) -> Result<Vec<Action>> {
     let mut matches = evaluate_query(files, &query);
     matches = apply_next_search_filter(matches, args)?;
     if args.only_timed {
-        matches.retain(|a| action_elapsed_seconds(a).is_some());
+        matches.retain(|a| action_timing_window(a).is_some());
     }
     if args.first_available && !next_filtered_mode(args) {
         // Ruby parity: in filtered mode we should not force @na.
@@ -412,80 +601,106 @@ fn next_actions(files: &[TodoFile], args: &NextArgs) -> Result<Vec<Action>> {
     Ok(matches)
 }
 
-fn output_time_summary(actions: &[Action], args: &NextArgs) -> Result<()> {
-    let mut timed: Vec<(String, i64)> = Vec::new();
-    for action in actions {
-        if let Some(secs) = action_elapsed_seconds(action) {
-            timed.push((action.text.clone(), secs));
-        }
-    }
-    let total: i64 = timed.iter().map(|(_, secs)| *secs).sum();
-    if args.json_times {
-        let payload = serde_json::json!({
-            "total_seconds": total,
-            "actions": timed.iter().map(|(text, secs)| serde_json::json!({"text": text, "seconds": secs})).collect::<Vec<_>>()
-        });
-        println!("{}", serde_json::to_string_pretty(&payload)?);
-        return Ok(());
-    }
-    if args.only_times {
-        if args.human {
-            println!("{}", human_duration(total));
-        } else {
-            println!("{total}");
-        }
-        return Ok(());
-    }
-    for (text, secs) in &timed {
-        if args.human {
-            println!("{text} [{}]", human_duration(*secs));
-        } else {
-            println!("{text} [{secs}s]");
-        }
-    }
-    if args.human {
-        println!("Total: {}", human_duration(total));
+fn render_next_time_block(cli: &Cli, args: &NextArgs, actions: &[Action]) -> Result<()> {
+    let style = OutputStyle {
+        color: output_color_enabled(cli),
+        na_tag: "na",
+        include_notes: args.effective_notes(),
+        wrap_width: output_wrap_columns(cli),
+    };
+    let theme = if style.color {
+        Theme::load()
     } else {
-        println!("Total: {total}s");
+        Theme::default()
+    };
+    let file_labels = if args.no_file {
+        HashMap::new()
+    } else {
+        build_filename_labels(actions)
+    };
+    let flags = TimeOutputFlags {
+        human: args.human,
+        inline_times: args.times && !args.only_times,
+        only_times: args.only_times,
+        json_times: args.json_times,
+    };
+    render_actions_time_summary(actions, flags, style, &theme, &file_labels, args.no_file)
+}
+
+fn render_find_time_block(cli: &Cli, args: &FindArgs, actions: &[Action]) -> Result<()> {
+    let style = OutputStyle {
+        color: output_color_enabled(cli),
+        na_tag: "na",
+        include_notes: args.effective_notes(),
+        wrap_width: output_wrap_columns(cli),
+    };
+    let theme = if style.color {
+        Theme::load()
+    } else {
+        Theme::default()
+    };
+    let file_labels = if args.no_file {
+        HashMap::new()
+    } else {
+        build_filename_labels(actions)
+    };
+    let flags = TimeOutputFlags {
+        human: args.human,
+        inline_times: args.times && !args.only_times,
+        only_times: args.only_times,
+        json_times: args.json_times,
+    };
+    render_actions_time_summary(actions, flags, style, &theme, &file_labels, args.no_file)
+}
+
+fn render_actions_time_summary(
+    actions: &[Action],
+    flags: TimeOutputFlags,
+    style: OutputStyle,
+    theme: &Theme,
+    file_labels: &HashMap<String, String>,
+    omit_filename: bool,
+) -> Result<()> {
+    let mut totals_by_tag: HashMap<String, i64> = HashMap::new();
+    let mut total_seconds: i64 = 0;
+    for action in actions {
+        if let Some((_, _, secs)) = action_timing_window(action) {
+            total_seconds += secs;
+            accumulate_timing_totals_by_tag(action, secs, &mut totals_by_tag);
+        }
+    }
+
+    if flags.json_times {
+        println!("{}", serialize_json_times(actions, &totals_by_tag, total_seconds)?);
+        return Ok(());
+    }
+
+    for action in actions {
+        if flags.only_times {
+            continue;
+        }
+        let fp = file_labels
+            .get(&action.source_file)
+            .map(String::as_str);
+        let mut line = format_action(&action, style, fp, theme, omit_filename);
+        if flags.inline_times {
+            if let Some((_, _, secs)) = action_timing_window(action) {
+                line.push_str(" [");
+                line.push_str(&format_ruby_duration(secs, flags.human));
+                line.push_str("]");
+            }
+        }
+        println!("{}", line);
+    }
+
+    let show_footer = flags.inline_times || flags.only_times;
+    if show_footer && total_seconds > 0 {
+        let mut buf = String::new();
+        render_duration_footer(&mut buf, total_seconds, flags.human, &totals_by_tag)
+            .map_err(|_| anyhow::anyhow!("time footer"))?;
+        print!("{}", buf);
     }
     Ok(())
-}
-
-fn human_duration(total_seconds: i64) -> String {
-    let hours = total_seconds / 3600;
-    let minutes = (total_seconds % 3600) / 60;
-    let seconds = total_seconds % 60;
-    if hours > 0 {
-        format!("{hours}h {minutes}m {seconds}s")
-    } else if minutes > 0 {
-        format!("{minutes}m {seconds}s")
-    } else {
-        format!("{seconds}s")
-    }
-}
-
-fn action_elapsed_seconds(action: &Action) -> Option<i64> {
-    let started = parse_tag_datetime(action.tag_value("started")?)?;
-    let done = parse_tag_datetime(action.tag_value("done")?)?;
-    let secs = (done - started).num_seconds();
-    if secs >= 0 { Some(secs) } else { None }
-}
-
-fn parse_tag_datetime(input: &str) -> Option<DateTime<Utc>> {
-    if let Ok(dt) = DateTime::parse_from_rfc3339(input) {
-        return Some(dt.with_timezone(&Utc));
-    }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M:%S") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-    }
-    if let Ok(ndt) = NaiveDateTime::parse_from_str(input, "%Y-%m-%d %H:%M") {
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-    }
-    if let Ok(nd) = NaiveDate::parse_from_str(input, "%Y-%m-%d") {
-        let ndt = nd.and_hms_opt(0, 0, 0)?;
-        return Some(DateTime::<Utc>::from_naive_utc_and_offset(ndt, Utc));
-    }
-    None
 }
 
 fn build_next_query(args: &NextArgs) -> Result<Query> {
@@ -616,8 +831,15 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
     }
     let files = load_find_todo_files(cli, args)?;
     let mut matches = find_actions_with_options(&files, args)?;
-    if !args.done {
+    let effective_done = args.done
+        || args.json_times
+        || args.only_times
+        || args.only_timed;
+    if !effective_done {
         matches.retain(|a| !a.done);
+    }
+    if args.only_timed {
+        matches.retain(|a| action_timing_window(a).is_some());
     }
     if let Some(project) = &args.project {
         let needle = project.to_ascii_lowercase();
@@ -642,18 +864,25 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
             .filter(|a| !set.contains(&(a.source_file.clone(), a.line_index)))
             .collect();
     }
-    if args.times {
-        output_find_time_summary(&matches, args.human);
-        return Ok(());
-    }
     if let Some(merged) = run_find_plugin_merge(args, &matches)? {
         matches = merged;
+    }
+
+    let wants_time_block = args.times || args.json_times || args.only_times;
+    if wants_time_block && (args.json_times || !args.nest_for_display()) {
+        return render_find_time_block(cli, args, &matches);
     }
 
     let style = OutputStyle {
         color: output_color_enabled(cli),
         na_tag: "na",
         include_notes: args.effective_notes(),
+        wrap_width: output_wrap_columns(cli),
+    };
+    let theme = if style.color {
+        Theme::load()
+    } else {
+        Theme::default()
     };
     let file_labels = if args.no_file {
         HashMap::new()
@@ -670,11 +899,12 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
             style,
             &file_labels,
             &matches,
+            &theme,
         );
     } else {
         for action in matches {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!("{}", format_action(&action, style, file_prefix));
+            println!("{}", format_action(&action, style, file_prefix, &theme, args.no_file));
         }
     }
     Ok(())
@@ -695,28 +925,6 @@ fn run_find_plugin_merge(args: &FindArgs, actions: &[Action]) -> Result<Option<V
     let out_fmt = output.unwrap_or(plugin.output_format);
     let merged = merge_plugin_stdout_into_actions(actions, &stdout, out_fmt, divider)?;
     Ok(Some(merged))
-}
-
-fn output_find_time_summary(actions: &[Action], human: bool) {
-    let mut timed: Vec<(String, i64)> = Vec::new();
-    for action in actions {
-        if let Some(secs) = action_elapsed_seconds(action) {
-            timed.push((action.text.clone(), secs));
-        }
-    }
-    let total: i64 = timed.iter().map(|(_, secs)| *secs).sum();
-    for (text, secs) in &timed {
-        if human {
-            println!("{text} [{}]", human_duration(*secs));
-        } else {
-            println!("{text} [{secs}s]");
-        }
-    }
-    if human {
-        println!("Total: {}", human_duration(total));
-    } else {
-        println!("Total: {total}s");
-    }
 }
 
 fn load_find_todo_files(cli: &Cli, args: &FindArgs) -> Result<Vec<TodoFile>> {
@@ -781,6 +989,7 @@ fn find_actions_with_options(files: &[TodoFile], args: &FindArgs) -> Result<Vec<
     Ok(out)
 }
 
+/// Builds tag filters then delegates to [`run_find`] so **all** find flags apply (`--no-file`, `--nest`, plugins, etc.).
 fn run_tagged(cli: &Cli, args: &TaggedArgs) -> Result<()> {
     let mut find = args.find.clone();
     if !args.tags.is_empty() {
@@ -842,32 +1051,34 @@ fn run_completed(cli: &Cli, args: &CompletedArgs) -> Result<()> {
         color: output_color_enabled(cli),
         na_tag: "na",
         include_notes: args.effective_notes(),
+        wrap_width: output_wrap_columns(cli),
     };
-    let file_labels = build_filename_labels(&matches);
+    let theme = if style.color {
+        Theme::load()
+    } else {
+        Theme::default()
+    };
+    let file_labels = if args.no_file {
+        HashMap::new()
+    } else {
+        build_filename_labels(&matches)
+    };
     if args.nest_for_display() {
-        let by_file = group_actions_by_file(&matches);
-        for (file, actions_in_file) in by_file {
-            println!("== {file}");
-            if args.omnifocus {
-                let by_proj = group_actions_by_project(&actions_in_file);
-                for (proj, acts) in by_proj {
-                    println!("## {proj}");
-                    for action in acts {
-                        let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-                        println!("{}", format_action(action, style, file_prefix));
-                    }
-                }
-            } else {
-                for action in actions_in_file {
-                    let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-                    println!("{}", format_action(action, style, file_prefix));
-                }
-            }
-        }
+        print_next_nested(
+            &NextArgs {
+                nest: args.nest,
+                omnifocus: args.omnifocus,
+                ..implicit_next_args()
+            },
+            style,
+            &file_labels,
+            &matches,
+            &theme,
+        );
     } else {
         for action in matches {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!("{}", format_action(&action, style, file_prefix));
+            println!("{}", format_action(&action, style, file_prefix, &theme, args.no_file));
         }
     }
     Ok(())
@@ -966,6 +1177,18 @@ fn completed_matches_date(
 
 fn output_color_enabled(cli: &Cli) -> bool {
     !cli.no_color && std::io::stdout().is_terminal()
+}
+
+/// Terminal width from `$COLUMNS` when stdout is a TTY.
+///
+/// **`format_action` (flat list)** applies word wrap only when color is disabled, so forcing
+/// color still yields a single long line there. **`--nest` / `--omnifocus`** use this width for
+/// action bodies whenever `COLUMNS` is set, including with theme colors (prefix width skips ANSI).
+fn output_wrap_columns(_cli: &Cli) -> Option<usize> {
+    if !std::io::stdout().is_terminal() {
+        return None;
+    }
+    std::env::var("COLUMNS").ok()?.parse().ok()
 }
 
 fn build_filename_labels(actions: &[Action]) -> HashMap<String, String> {
@@ -1150,117 +1373,6 @@ fn resolve_add_project(todo: &TodoFile, project: &str, interactive: bool) -> Res
     }
     let idx = choose_from_menu("Multiple matching projects found, select target", &resolved, interactive)?;
     Ok(resolved[idx].clone())
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PathAxis {
-    Child,
-    Desc,
-}
-
-#[derive(Debug, Clone)]
-struct PathStep {
-    axis: PathAxis,
-    text: String,
-    wildcard: bool,
-}
-
-fn resolve_item_path(path: &str, projects: &[String]) -> Vec<String> {
-    let steps = parse_item_path(path);
-    if steps.is_empty() {
-        return Vec::new();
-    }
-    let chains: Vec<Vec<String>> = projects
-        .iter()
-        .map(|p| p.split(':').map(|s| s.trim().to_string()).collect::<Vec<_>>())
-        .collect();
-    let mut current: Vec<Vec<String>> = vec![Vec::new()];
-    for step in steps {
-        let mut next = Vec::<Vec<String>>::new();
-        match step.axis {
-            PathAxis::Child => {
-                for base in &current {
-                    for chain in &chains {
-                        if chain.len() <= base.len() {
-                            continue;
-                        }
-                        if !chain.starts_with(base) {
-                            continue;
-                        }
-                        let part = &chain[base.len()];
-                        if step.wildcard || part.eq_ignore_ascii_case(&step.text) {
-                            let candidate = chain[..=base.len()].to_vec();
-                            if !next.iter().any(|n| n == &candidate) {
-                                next.push(candidate);
-                            }
-                        }
-                    }
-                }
-            }
-            PathAxis::Desc => {
-                for base in &current {
-                    for chain in &chains {
-                        if chain.len() <= base.len() || !chain.starts_with(base) {
-                            continue;
-                        }
-                        for i in base.len()..chain.len() {
-                            let part = &chain[i];
-                            if step.wildcard || part.eq_ignore_ascii_case(&step.text) {
-                                let candidate = chain[..=i].to_vec();
-                                if !next.iter().any(|n| n == &candidate) {
-                                    next.push(candidate);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        current = next;
-        if current.is_empty() {
-            break;
-        }
-    }
-    current
-        .into_iter()
-        .map(|c| c.join(":"))
-        .collect()
-}
-
-fn parse_item_path(path: &str) -> Vec<PathStep> {
-    let s = path.trim();
-    if !s.starts_with('/') {
-        return Vec::new();
-    }
-    let bytes = s.as_bytes();
-    let mut i = 0usize;
-    let mut out = Vec::new();
-    while i < bytes.len() {
-        if bytes[i] != b'/' {
-            break;
-        }
-        let axis = if i + 1 < bytes.len() && bytes[i + 1] == b'/' {
-            i += 2;
-            PathAxis::Desc
-        } else {
-            i += 1;
-            PathAxis::Child
-        };
-        let start = i;
-        while i < bytes.len() && bytes[i] != b'/' {
-            i += 1;
-        }
-        let text = s[start..i].trim().to_string();
-        if text.is_empty() {
-            continue;
-        }
-        out.push(PathStep {
-            axis,
-            wildcard: text == "*",
-            text,
-        });
-    }
-    out
 }
 
 fn choose_from_menu(prompt: &str, options: &[String], interactive: bool) -> Result<usize> {
@@ -1480,13 +1592,11 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
     } else {
         choose_actions_interactive(&matches, interactive)?
     };
-    let edit_seed_text = if args.edit {
-        if selected.len() != 1 {
-            anyhow::bail!("--edit currently supports selecting exactly one action");
-        }
-        Some(selected[0].text.clone())
+
+    let selected_for_edit = if args.edit {
+        selected.clone()
     } else {
-        None
+        Vec::new()
     };
 
     let mut by_file: HashMap<String, std::collections::HashSet<usize>> = HashMap::new();
@@ -1497,7 +1607,7 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
             .insert(action.line_index);
     }
 
-    let mut mutation = UpdateMutation {
+    let base_mutation = UpdateMutation {
         add_tags: add_tags.clone(),
         remove_tags: remove_tags.clone(),
         done: mark_done,
@@ -1513,43 +1623,311 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
             .map(|pos| add_position_is_append(Some(pos)))
             .unwrap_or(true),
     };
-    if args.edit {
-        mutation.replace_text = Some(edit_action_text(
-            edit_seed_text
-                .as_deref()
-                .context("Missing selected action for --edit")?,
-        )?);
-    }
+
+    let edit_map = if args.edit {
+        Some(run_multi_action_editor(
+            args.editor.as_deref(),
+            &selected_for_edit,
+        )?)
+    } else {
+        None
+    };
+
     let mut updated_count = 0usize;
-    for todo in &mut files {
-        let key = todo.path.display().to_string();
-        if let Some(lines) = by_file.get(&key) {
-            updated_count += todo.apply_mutation_by_lines(lines, &mutation)?;
+    if args.edit {
+        let map = edit_map.as_ref().expect("edit map");
+        for todo in &mut files {
+            let key = todo.path.display().to_string();
+            let Some(lines) = by_file.get(&key) else {
+                continue;
+            };
+            let mut indices: Vec<usize> = lines.iter().copied().collect();
+            indices.sort_by(|a, b| b.cmp(a));
+            for line_idx in indices {
+                let action = selected_for_edit
+                    .iter()
+                    .find(|a| {
+                        a.line_index == line_idx
+                            && update_paths_equivalent(Path::new(&a.source_file), &todo.path)
+                    })
+                    .with_context(|| {
+                        format!(
+                            "internal error: no selected action for {:?} line {}",
+                            todo.path, line_idx
+                        )
+                    })?;
+                let (new_text, new_notes) =
+                    lookup_multi_action_edit(map, action).with_context(|| {
+                        format!(
+                            "missing edited content for {}:{} (keep `# ------` marker lines intact)",
+                            action.source_file, action.line_index
+                        )
+                    })?;
+                if new_text.trim().is_empty() {
+                    anyhow::bail!("Edited action text cannot be empty ({})", action.source_file);
+                }
+                let mut m = base_mutation.clone();
+                m.replace_text = Some(expand_date_tags_in_line(&new_text));
+                m.note_lines = new_notes;
+                m.overwrite_notes = true;
+                updated_count +=
+                    todo.apply_mutation_by_lines(&HashSet::from([line_idx]), &m)?;
+            }
+        }
+    } else {
+        for todo in &mut files {
+            let key = todo.path.display().to_string();
+            if let Some(lines) = by_file.get(&key) {
+                updated_count += todo.apply_mutation_by_lines(lines, &base_mutation)?;
+            }
         }
     }
     println!("Updated {updated_count} action(s)");
     Ok(())
 }
 
-fn edit_action_text(initial: &str) -> Result<String> {
-    let mut path = std::env::temp_dir();
-    let stamp = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_nanos();
-    path.push(format!("na_update_edit_{stamp}.tmp"));
-    fs::write(&path, format!("{initial}\n"))?;
-    let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-    let status = std::process::Command::new(editor).arg(&path).status()?;
+/// Ruby `NA::Editor.default_editor`: env chain, then runnable check, then `which` fallback list.
+fn resolve_update_editor(cli_override: Option<&str>) -> Result<String> {
+    const FALLBACK: &[&str] = &[
+        "vim", "vi", "code", "subl", "mate", "mvim", "nano", "emacs",
+    ];
+
+    if let Some(s) = cli_override {
+        let t = s.trim();
+        anyhow::ensure!(!t.is_empty(), "`--editor` is empty");
+        if editor_first_token_executable(t) {
+            return Ok(t.to_string());
+        }
+        anyhow::bail!("editor from `--editor` is not runnable on this system: {:?}", t);
+    }
+
+    let env_specs = [
+        std::env::var("NA_EDITOR").ok(),
+        std::env::var("GIT_EDITOR").ok(),
+        std::env::var("EDITOR").ok(),
+    ];
+    for spec in env_specs.into_iter().flatten() {
+        let t = spec.trim();
+        if t.is_empty() {
+            continue;
+        }
+        if editor_first_token_executable(&spec) {
+            return Ok(spec);
+        }
+    }
+
+    for name in FALLBACK {
+        if let Some(path) = which_executable_under_path(name) {
+            return Ok(path);
+        }
+    }
+
+    anyhow::bail!(
+        "No runnable editor found. Install one of {}, or set NA_EDITOR, GIT_EDITOR, or EDITOR.",
+        FALLBACK.join(", ")
+    );
+}
+
+#[cfg(unix)]
+fn path_entry_is_executable(path: &Path) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+    std::fs::metadata(path)
+        .map(|m| !m.is_dir() && m.permissions().mode() & 0o111 != 0)
+        .unwrap_or(false)
+}
+
+#[cfg(not(unix))]
+fn path_entry_is_executable(path: &Path) -> bool {
+    path.is_file()
+}
+
+fn executable_path_if_ok(path: &Path) -> Option<String> {
+    if path_entry_is_executable(path) {
+        return path.to_str().map(std::borrow::ToOwned::to_owned);
+    }
+    None
+}
+
+fn which_executable_under_path(prog_first_token: &str) -> Option<String> {
+    let token = prog_first_token.trim();
+    if token.is_empty() {
+        return None;
+    }
+    let p = Path::new(token);
+    if token.contains('/') {
+        return executable_path_if_ok(p);
+    }
+    let path_var = std::env::var_os("PATH")?;
+    for dir in std::env::split_paths(&path_var) {
+        let full = dir.join(token);
+        if let Some(hit) = executable_path_if_ok(&full) {
+            return Some(hit);
+        }
+    }
+    None
+}
+
+/// True when the leading token of `editor_spec` resolves to an executable path.
+fn editor_first_token_executable(editor_spec: &str) -> bool {
+    editor_spec.trim().split_whitespace().next().is_some_and(|prog| {
+        !prog.is_empty() && which_executable_under_path(prog).is_some()
+    })
+}
+
+/// Ruby `NA::Editor.args_for_editor`: extra flags for GUI editors / vim when the spec is a bare binary name.
+pub(crate) fn editor_program_and_extra_args(editor_spec: &str) -> (String, Vec<String>) {
+    let parts: Vec<&str> = editor_spec.trim().split_whitespace().collect();
+    if parts.is_empty() {
+        return ("vi".to_string(), Vec::new());
+    }
+    if parts.len() >= 2 {
+        return (
+            parts[0].to_string(),
+            parts[1..].iter().map(|s| s.to_string()).collect(),
+        );
+    }
+    let prog = parts[0].to_string();
+    let base = Path::new(&prog)
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(prog.as_str());
+    let flags: Vec<String> = match base {
+        "vim" | "mvim" => vec!["-f".into()],
+        "code" | "subl" | "mate" => vec!["-w".into()],
+        _ => vec![],
+    };
+    (prog, flags)
+}
+
+fn run_editor_wait(path: &Path, editor_spec: &str) -> Result<()> {
+    let (prog, flags) = editor_program_and_extra_args(editor_spec);
+    let status = std::process::Command::new(&prog)
+        .args(&flags)
+        .arg(path)
+        .status()?;
     if !status.success() {
-        let _ = fs::remove_file(&path);
         anyhow::bail!("Editor exited with failure status");
     }
-    let edited = fs::read_to_string(&path)?.trim().to_string();
-    let _ = fs::remove_file(&path);
-    if edited.is_empty() {
-        anyhow::bail!("Edited action text cannot be empty");
+    Ok(())
+}
+
+/// Ruby `NA::Editor.format_multi_action_input` (subset: instructions + `# ------ path:line` blocks).
+fn format_multi_action_edit_buffer(actions: &[Action]) -> String {
+    let header = concat!(
+        "# Instructions:\n",
+        "# - Edit the action text (the lines WITHOUT # comment markers)\n",
+        "# - DO NOT remove or edit the lines starting with \"# ------\"\n",
+        "# - Add notes on new lines after the action\n",
+        "# - Blank lines are ignored\n",
+        "#\n",
+    );
+    let mut content = String::from(header);
+    for action in actions {
+        content.push_str(&format!(
+            "# ------ {}:{}\n",
+            action.source_file, action.line_index
+        ));
+        content.push_str(&action.text);
+        content.push('\n');
+        if !action.notes.is_empty() {
+            for n in &action.notes {
+                content.push_str(n);
+                content.push('\n');
+            }
+        }
+        content.push('\n');
     }
-    Ok(edited)
+    content
+}
+
+/// Ruby `NA::Editor.parse_multi_action_output`.
+pub(crate) fn parse_multi_action_edit_output(
+    content: &str,
+) -> Result<HashMap<(String, usize), (String, Vec<String>)>> {
+    let mut results: HashMap<(String, usize), (String, Vec<String>)> = HashMap::new();
+    let mut cur_key: Option<(String, usize)> = None;
+    let mut cur_action: Option<String> = None;
+    let mut cur_notes: Vec<String> = Vec::new();
+
+    for line in content.lines() {
+        let stripped = line.trim();
+        if let Some(rest) = stripped.strip_prefix("# ------ ") {
+            if let (Some(k), Some(a)) = (cur_key.take(), cur_action.take()) {
+                results.insert(k, (a, std::mem::take(&mut cur_notes)));
+            } else {
+                cur_notes.clear();
+            }
+            let colon = rest.rfind(':').with_context(|| {
+                format!("invalid `# ------` marker (expected path:line): {stripped:?}")
+            })?;
+            let path_part = rest[..colon].trim();
+            let line_num = rest[colon + 1..].trim().parse::<usize>().with_context(|| {
+                format!("invalid line number in `# ------` marker: {stripped:?}")
+            })?;
+            cur_key = Some((path_part.to_string(), line_num));
+            cur_action = None;
+            continue;
+        }
+        if stripped.starts_with('#') {
+            continue;
+        }
+        if stripped.is_empty() {
+            continue;
+        }
+        if cur_key.is_none() {
+            continue;
+        }
+        if cur_action.is_none() {
+            cur_action = Some(stripped.to_string());
+        } else {
+            cur_notes.push(stripped.to_string());
+        }
+    }
+    if let (Some(k), Some(a)) = (cur_key, cur_action) {
+        results.insert(k, (a, cur_notes));
+    }
+    Ok(results)
+}
+
+fn lookup_multi_action_edit(
+    map: &HashMap<(String, usize), (String, Vec<String>)>,
+    action: &Action,
+) -> Option<(String, Vec<String>)> {
+    let key = (action.source_file.clone(), action.line_index);
+    if let Some(v) = map.get(&key) {
+        return Some(v.clone());
+    }
+    for ((p, li), v) in map {
+        if *li == action.line_index
+            && update_paths_equivalent(Path::new(p), Path::new(&action.source_file))
+        {
+            return Some(v.clone());
+        }
+    }
+    None
+}
+
+fn run_multi_action_editor(
+    editor_override: Option<&str>,
+    actions: &[Action],
+) -> Result<HashMap<(String, usize), (String, Vec<String>)>> {
+    if actions.is_empty() {
+        anyhow::bail!("No actions to edit");
+    }
+    let body = format_multi_action_edit_buffer(actions);
+    let mut path = std::env::temp_dir();
+    path.push(format!(
+        "na_update_edit_{}.na",
+        std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos()
+    ));
+    fs::write(&path, body)?;
+    let editor = resolve_update_editor(editor_override)?;
+    run_editor_wait(&path, &editor)?;
+    let edited = fs::read_to_string(&path)?;
+    let _ = fs::remove_file(&path);
+    parse_multi_action_edit_output(&edited)
 }
 
 fn run_edit(cli: &Cli, args: &EditArgs) -> Result<()> {
@@ -1575,6 +1953,7 @@ fn run_edit(cli: &Cli, args: &EditArgs) -> Result<()> {
         at: None,
         archive: false,
         edit: false,
+        editor: None,
         delete: false,
         restore: false,
         note: Vec::new(),
@@ -1619,6 +1998,7 @@ fn run_move(cli: &Cli, args: &MoveArgs) -> Result<()> {
         at: args.at.clone(),
         archive: false,
         edit: false,
+        editor: None,
         delete: false,
         restore: false,
         note: Vec::new(),
@@ -1676,6 +2056,7 @@ fn run_tag(cli: &Cli, args: &TagArgs) -> Result<()> {
         at: None,
         archive: false,
         edit: false,
+        editor: None,
         delete: false,
         restore: false,
         note: Vec::new(),
@@ -2099,6 +2480,80 @@ fn load_update_todo_files(cli: &Cli, args: &UpdateArgs) -> Result<Vec<TodoFile>>
         .collect()
 }
 
+fn update_path_for_compare(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
+}
+
+/// Match a loaded todo path against a query path (`foo.taskpaper`, `./a/foo.taskpaper`, or absolute).
+fn update_paths_equivalent(loaded: &Path, query: &Path) -> bool {
+    if loaded == query {
+        return true;
+    }
+    let ls = update_path_for_compare(loaded).trim_start_matches("./").to_string();
+    let qs = update_path_for_compare(query).trim_start_matches("./").to_string();
+    if ls == qs {
+        return true;
+    }
+    if let (Ok(lc), Ok(qc)) = (loaded.canonicalize(), query.canonicalize()) {
+        if lc == qc {
+            return true;
+        }
+    }
+    if qs.contains('/') {
+        ls.ends_with(qs.as_str()) || ls.ends_with(&format!("/{qs}"))
+    } else {
+        loaded.file_name().and_then(|n| n.to_str()) == Some(qs.as_str())
+    }
+}
+
+/// Trailing `:LINE` decimal suffix; path may contain other `:` (e.g. `pro:ject/file.tp`).
+/// Returns `None` so callers fall through to substring / `@search` / `--regex`.
+fn parse_update_path_colon_line_query(query: &str) -> Option<(String, usize)> {
+    let q = query.trim();
+    if q.starts_with("@search(") {
+        return None;
+    }
+    static RE: OnceLock<regex::Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| {
+        regex::Regex::new(r"(?ms)^(?P<p>.+):(?P<n>\d+)$")
+            .expect("update path:line regex")
+    });
+    let caps = re.captures(q)?;
+    let path_str = caps.name("p")?.as_str().trim();
+    if path_str.is_empty() {
+        return None;
+    }
+    let line_1 = caps.name("n")?.as_str().parse::<usize>().ok()?;
+    if line_1 == 0 {
+        return None;
+    }
+    Some((path_str.to_string(), line_1))
+}
+
+/// `PATH:LINE` selection against loaded todos. **`None`** → not path:line syntax.
+/// **`Some(vec)`** → syntax matched; **`vec` empty** if no todo path matched or nothing on that line.
+fn seed_matches_update_path_colon_line(files: &[TodoFile], query: &str) -> Option<Vec<Action>> {
+    let (path_str, line_1based) = parse_update_path_colon_line_query(query)?;
+    let idx = line_1based - 1;
+    let query_path = Path::new(path_str.trim());
+    let mut saw_matching_file = false;
+    let mut out = Vec::new();
+    for tf in files {
+        if update_paths_equivalent(&tf.path, query_path) {
+            saw_matching_file = true;
+            out.extend(
+                tf.actions()
+                    .into_iter()
+                    .filter(|a| a.line_index == idx),
+            );
+        }
+    }
+    if !saw_matching_file {
+        return Some(Vec::new());
+    }
+    Some(out)
+}
+
 fn collect_update_candidates(files: &[TodoFile], args: &UpdateArgs) -> Result<Vec<Action>> {
     let mut out = if let Some(q) = args.query.as_deref() {
         update_seed_matches(files, q, args)?
@@ -2127,6 +2582,9 @@ fn update_seed_matches(files: &[TodoFile], pattern: &str, args: &UpdateArgs) -> 
     if query.starts_with("@search(") && !args.regex && !args.exact {
         let parsed = Query::parse(query)?;
         return Ok(evaluate_query(files, &parsed));
+    }
+    if let Some(found) = seed_matches_update_path_colon_line(files, query) {
+        return Ok(found);
     }
     let mut out: Vec<Action> = files.iter().flat_map(TodoFile::actions).collect();
     let include_notes = args.search_notes && !args.no_search_notes;
@@ -2538,14 +2996,16 @@ fn _single_target(cli: &Cli) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        abbreviate_source_path, action_elapsed_seconds, add_position_is_append, build_add_text,
+        abbreviate_source_path, add_position_is_append, build_add_text,
         choose_from_menu, completed_matches_date, completed_matches_pattern, find_actions,
         find_actions_with_options,
         format_saved_search, implicit_next_args, is_cancel_selection, load_next_todo_files,
-        list_saved_searches, load_update_todo_files, match_todo_path, next_actions, parse_multi_selection,
+        list_saved_searches, load_update_todo_files, match_todo_path, next_actions,
+        editor_program_and_extra_args, omnifocus_auxiliary_tags_suffix, parse_multi_selection,
+        parse_multi_action_edit_output, update_seed_matches,
         parse_one_based_selection, parse_priority_value, parse_tag_input, parse_tag_datetime,
         open_command_for_target, parse_todo_specs, prompt_profile_path, read_scan_registry,
-        resolve_item_path, restore_target_from_backup_path, run_archive, run_edit, run_move,
+        restore_target_from_backup_path, run_archive, run_edit, run_move,
         run_plugin, run_prompt, run_saved, run_scan, run_tag,
         run_undo, run_update, save_next_search, saved_search_path, saved_search_slug,
         shell_quote_token, strip_trailing_note, write_scan_registry,
@@ -2555,11 +3015,13 @@ mod tests {
         NextArgs, PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs,
         UndoArgs, UpdateArgs,
     };
+    use crate::output::duration::action_elapsed_seconds;
+    use crate::parser::item_path::resolve_item_path;
     use crate::io::xdg::TEST_ENV_MUTEX;
     use crate::models::action::Action;
     use crate::models::todo::TodoFile;
     use clap::Parser;
-    use std::collections::HashSet;
+    use std::collections::{HashMap, HashSet};
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
@@ -2626,6 +3088,9 @@ mod tests {
             omnifocus: false,
             times: false,
             human: false,
+            only_timed: false,
+            json_times: false,
+            only_times: false,
             plugin: None,
             input: None,
             output: None,
@@ -2666,6 +3131,177 @@ mod tests {
         ));
         fs::write(&path, content).expect("fixture should write");
         path
+    }
+
+    #[test]
+    fn parse_multi_action_edit_output_preserves_blocks() {
+        let raw = r#"# Instructions:
+# ------ /tmp/a.taskpaper:1
+One @na
+note line
+
+# ------ /tmp/a.taskpaper:3
+Two
+
+"#;
+        let m = parse_multi_action_edit_output(raw).expect("parse");
+        assert_eq!(m.len(), 2);
+        let one = m
+            .get(&("/tmp/a.taskpaper".to_string(), 1))
+            .expect("first action");
+        assert_eq!(one.0, "One @na");
+        assert_eq!(one.1, vec!["note line".to_string()]);
+        assert!(m.contains_key(&("/tmp/a.taskpaper".to_string(), 3)));
+        assert_eq!(
+            m.get(&("/tmp/a.taskpaper".to_string(), 3)).unwrap().0,
+            "Two"
+        );
+    }
+
+    #[test]
+    fn editor_program_inserts_wait_flags_like_ruby() {
+        let (p, a) = editor_program_and_extra_args("vim");
+        assert_eq!(p, "vim");
+        assert_eq!(a, vec!["-f"]);
+        let (p2, a2) = editor_program_and_extra_args("vim -f");
+        assert_eq!(p2, "vim");
+        assert_eq!(a2, vec!["-f"]);
+    }
+
+    #[test]
+    fn update_seed_matches_accepts_path_colon_line_query() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Ship feature @na
+Inbox:
+- Other
+"#,
+        );
+        let todo = TodoFile::load(&path).expect("load");
+        let ship = todo
+            .actions()
+            .into_iter()
+            .find(|a| a.text.contains("Ship"))
+            .expect("ship action");
+        let args = base_update_args();
+        let stem = path.file_name().expect("stem").to_str().expect("utf8");
+        let q = format!("{}:{}", stem, ship.line_index + 1);
+        let found = update_seed_matches(&[todo.clone()], &q, &args).expect("matches");
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].line_index, ship.line_index);
+
+        let q_abs = format!("{}:{}", path.to_string_lossy(), ship.line_index + 1);
+        let found_abs = update_seed_matches(&[todo], &q_abs, &args).expect("abs");
+        assert_eq!(found_abs.len(), 1);
+
+        let bogus_line = format!("{stem}:9999");
+        assert!(
+            update_seed_matches(&[TodoFile::load(&path).expect("re")], &bogus_line, &args)
+                .expect("no line")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn update_path_colon_syntax_without_matching_file_skips_plain_substring_search() {
+        let path = write_fixture_taskpaper("- Only mention x vaguely\n");
+        let todo = TodoFile::load(&path).expect("load");
+        let args = base_update_args();
+        // Valid path:LINE shape; path `x` matches no todo file -> empty (no substring-match fallback).
+        let hits = update_seed_matches(&[todo], "x:1", &args).expect("hits");
+        assert!(hits.is_empty());
+    }
+
+    #[test]
+    fn update_seed_path_colon_parses_trailing_line_so_colons_in_directories_work() {
+        let dir = std::env::temp_dir().join(format!(
+            "na_rust_pathcolon_{}_{}",
+            std::process::id(),
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .expect("time")
+                .as_nanos(),
+        ));
+        let inner = dir.join("proj:colon");
+        fs::create_dir_all(&inner).expect("mkdir");
+        let tp = inner.join("list.taskpaper");
+        fs::write(
+            &tp,
+            r#"Area:
+  - Tagged @na
+"#,
+        )
+        .expect("write todo");
+        let todo = TodoFile::load(&tp).expect("load");
+        let line_1based = todo
+            .actions()
+            .iter()
+            .find(|a| a.text.contains("Tagged"))
+            .expect("row")
+            .line_index
+            + 1;
+        let full = tp.to_string_lossy().replace('\\', "/");
+        let args = base_update_args();
+        let hits = update_seed_matches(
+            &[todo.clone()],
+            &format!("{full}:{line_1based}"),
+            &args,
+        )
+        .expect("full path");
+        assert_eq!(hits.len(), 1, "{full}:{line_1based}");
+        let hits_short = update_seed_matches(
+            &[todo],
+            &format!(
+                "{}:{line_1based}",
+                tp.file_name().expect("stem").to_str().expect("utf8"),
+            ),
+            &args,
+        )
+        .expect("basename");
+        assert_eq!(hits_short.len(), 1);
+    }
+
+    #[test]
+    fn omnifocus_auxiliary_tags_suffix_like_ruby_output_children() {
+        let a = Action {
+            text: "Buy milk @na @priority(5) @due(today) @context(home-office)".into(),
+            line_index: 1,
+            project: None,
+            project_chain: vec![],
+            notes: vec![],
+            tags: vec![
+                "@na".into(),
+                "@priority".into(),
+                "@due".into(),
+                "@context".into(),
+            ],
+            tag_values: HashMap::from([
+                ("priority".into(), "5".into()),
+                ("due".into(), "today".into()),
+                ("context".into(), "home-office".into()),
+            ]),
+            done: false,
+            due: None,
+            source_file: "t.taskpaper".into(),
+        };
+        assert_eq!(
+            omnifocus_auxiliary_tags_suffix(&a),
+            " @tags(na,priority-5,context-home-office)"
+        );
+
+        let due_only = Action {
+            text: "x @due(t)".into(),
+            line_index: 0,
+            project: None,
+            project_chain: vec![],
+            notes: vec![],
+            tags: vec!["@due".into()],
+            tag_values: HashMap::from([("due".into(), "t".into())]),
+            done: false,
+            due: None,
+            source_file: "t.taskpaper".into(),
+        };
+        assert_eq!(omnifocus_auxiliary_tags_suffix(&due_only), "");
     }
 
     #[test]
@@ -3119,6 +3755,7 @@ ProjectB:
             at: None,
             archive: false,
             edit: false,
+            editor: None,
             delete: false,
             restore: false,
             note: Vec::new(),
@@ -3146,6 +3783,7 @@ ProjectB:
             tagged: Vec::new(),
             nest: false,
             omnifocus: false,
+            no_file: false,
             save: None,
         }
     }
