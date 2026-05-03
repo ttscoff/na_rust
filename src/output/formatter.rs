@@ -8,8 +8,11 @@ use std::sync::OnceLock;
 fn tag_token_regex() -> &'static Regex {
     static RX: OnceLock<Regex> = OnceLock::new();
     RX.get_or_init(|| {
+        // Align with Ruby `String#highlight_tags` (`na_gem/lib/na/string.rb`): tag names are
+        // `@[^ ("']+` with optional `(…)`. Values use non-greedy `.*?` until the first `)`,
+        // same as the gem (no nested-paren balancing).
         Regex::new(
-            r"(?P<pre>(?-u:^|[[:space:]]))(?P<tag>@[A-Za-z0-9_-]+)(?:(?P<lparen>\()(?P<val>[^)]*)(?P<rparen>\)))",
+            r"(?P<pre>(?-u:^|[[:space:]]))(?P<tag>@[^ (@']+)(?:(?P<lparen>\()(?P<val>.*?)(?P<rparen>\)))",
         )
         .expect("tag highlight regex")
     })
@@ -34,6 +37,29 @@ impl Default for OutputStyle {
             wrap_width: None,
         }
     }
+}
+
+/// Ruby `Action#pretty`: `action_text.gsub!(/\{(.*?)\}/, '\\{\1\\}')` before stripping `@na`, so
+/// literal `{...}` in the task line does not interact with `NA::Color.template` brace syntax.
+fn escape_curly_groups_like_ruby_action_pretty(input: &str) -> String {
+    static RE: OnceLock<Regex> = OnceLock::new();
+    let re = RE.get_or_init(|| Regex::new(r"\{(.*?)\}").expect("brace escape regex"));
+    re.replace_all(input, |caps: &regex::Captures| {
+        let inner = caps.get(1).map(|m| m.as_str()).unwrap_or("");
+        let mut s = String::with_capacity(inner.len() + 4);
+        s.push('\\');
+        s.push('{');
+        s.push_str(inner);
+        s.push('\\');
+        s.push('}');
+        s
+    })
+    .into_owned()
+}
+
+/// Ruby `pretty` ends with `final_output.gsub!('\\{', '{')` before the last `Color.template` pass.
+fn unescape_leading_brace_backslashes_like_ruby(s: &str) -> String {
+    s.replace("\\{", "{")
 }
 
 /// Strip the next-action token once, matching Ruby `Action#pretty` (`sub(/ @#{NA.na_tag}\b/, '')`).
@@ -313,9 +339,11 @@ pub fn format_action(
     theme: &Theme,
     omit_filename: bool,
 ) -> String {
-    let plain_body = strip_na_token(action.text.clone(), style.na_tag);
+    let escaped = escape_curly_groups_like_ruby_action_pretty(action.text.as_str());
+    let plain_body = strip_na_token(escaped, style.na_tag);
 
-    let line_body = format!(":{}", action.line_index);
+    // Ruby `Action#pretty` builds `line_num` as `:#{@line} ` (trailing space before reset).
+    let line_body = format!(":{} ", action.line_index);
     let leaf_project = action
         .project_chain
         .last()
@@ -393,8 +421,13 @@ pub fn format_action(
         String::new()
     };
 
+    // Single-file themes abut `%parents%%line%`; multi-file abuts `%line%%parents%` with no extra
+    // space before `%parents%` (Ruby `%filename%line%parents %action`). Only single-file adds a
+    // trailing space after the bracket segment so `%parents%%line%` reads as `[P] :N …`.
     let parents_with_space = if parents_segment.is_empty() {
         String::new()
+    } else if multi_file {
+        parents_segment.clone()
     } else {
         format!("{parents_segment} ")
     };
@@ -455,7 +488,7 @@ pub fn format_action(
             output.push_str(note);
         }
     }
-    output
+    unescape_leading_brace_backslashes_like_ruby(&output)
 }
 
 #[cfg(test)]
@@ -510,7 +543,7 @@ mod tests {
             &Theme::default(),
             false,
         );
-        assert_eq!(out, "[ProjectA] :4 Draft report @priority(5)");
+        assert_eq!(out, "[ProjectA] :4  Draft report @priority(5)");
     }
 
     #[test]
@@ -549,6 +582,45 @@ mod tests {
     }
 
     #[test]
+    fn flat_action_brace_escape_matches_ruby_after_na_strip() {
+        let a = Action {
+            text: "Try {m} and @na".to_string(),
+            line_index: 1,
+            project: Some("Inbox".to_string()),
+            project_chain: vec!["Inbox".to_string()],
+            notes: Vec::new(),
+            tags: vec!["@na".to_string()],
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+            source_file: "t.taskpaper".to_string(),
+        };
+        let out = format_action(
+            &a,
+            OutputStyle {
+                wrap_width: None,
+                ..Default::default()
+            },
+            None,
+            &Theme::default(),
+            false,
+        );
+        assert_eq!(out, "[Inbox] :1  Try {m\\} and");
+    }
+
+    #[test]
+    fn color_action_body_highlights_tag_chars_like_ruby_highlight_tags() {
+        let theme = Theme::default();
+        let body = "Touch @foo.bar @special-tag(home) done";
+        let out = super::color_action_body(body, &[], true, &theme);
+        assert!(
+            out.contains("@foo.bar"),
+            "Ruby tag pattern allows dots/hyphens beyond \\w: {out:?}"
+        );
+        assert!(out.contains("@special-tag"));
+    }
+
+    #[test]
     fn color_action_body_highlights_tag_name_parens_and_value_like_ruby() {
         let theme = Theme::default();
         let body = "Do it @priority(5) now";
@@ -582,17 +654,17 @@ mod tests {
             &theme,
             false,
         );
-        assert_eq!(out, ":4 [ProjectA] Draft report @priority(5)");
+        assert_eq!(out, ":4  [ProjectA] Draft report @priority(5)");
     }
 
     #[test]
     fn substitute_output_template_unit() {
         assert_eq!(
             super::substitute_output_template(
-                "%filename%%line% %parents%%action%",
+                "%filename%%line%%parents% %action%",
                 "a.taskpaper",
-                ":1",
-                "[P] ",
+                ":1 ",
+                "[P]",
                 "Proj",
                 "Todo",
                 "",
@@ -632,7 +704,7 @@ mod tests {
             &theme,
             false,
         );
-        assert_eq!(out, "ProjectA :4 Draft report @priority(5)");
+        assert_eq!(out, "ProjectA :4  Draft report @priority(5)");
     }
 
     #[test]
@@ -649,7 +721,7 @@ mod tests {
             &theme,
             true,
         );
-        assert_eq!(out, "[Draft report @priority(5)]:4");
+        assert_eq!(out, "[Draft report @priority(5)]:4 ");
     }
 
     #[test]

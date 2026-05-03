@@ -121,8 +121,7 @@ Placeholders match Ruby’s token set: `%filename` / `%filename%`, `%line` / `%l
 - [ ] **`next` / `find` / `completed` nested polish**
   (core shapes and **`scripts/diff_next.py`** scenarios for **`--nest`** / **`--omnifocus`** match Ruby; remaining gaps are mostly **theme.duration-style** brackets on timed nested lines if we choose parity there, and any edge cases not covered by fixtures.)
 - [x] Project label in action output uses leaf project (matches Ruby brackets)
-- [ ] Action text rendering parity beyond `@na` strip
-  (Ruby may strip or format other tags differently in some modes)
+- [ ] Residual flat action edge cases (literal `{…}` in tasks now follows Ruby escape/unescape; report odd nested-brace or tag-value edge cases with a fixture if they diverge from the gem)
 - [x] Archive filtering parity in current differential fixtures
 - [ ] **Ruby globals / leftover option shims**
   (e.g. parity for all legacy globals in `na_gem/bin/na` — `--color` vs `--no-color`-only,

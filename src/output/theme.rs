@@ -73,7 +73,9 @@ impl Default for ThemeTemplates {
         Self {
             default_tpl: "%parents%%line% %action%".to_string(),
             single_file: String::new(),
-            multi_file: "%filename%%line% %parents%%action%".to_string(),
+            // Ruby `theme[:templates][:multi_file]` abuts `%filename%`, `%line%`, and `%parents%`; the
+            // line segment itself ends with a trailing space (see `format_action` / Ruby `line_num`).
+            multi_file: "%filename%%line%%parents% %action%".to_string(),
             no_file: String::new(),
             output: String::new(), // When non-empty, flat layout for all modes (Ruby `templates.output`).
         }
@@ -114,7 +116,7 @@ impl Theme {
         }
         if multi_file {
             if self.templates.multi_file.is_empty() {
-                "%filename%%line% %parents%%action%"
+                "%filename%%line%%parents% %action%"
             } else {
                 self.templates.multi_file.as_str()
             }
@@ -255,7 +257,7 @@ mod tests {
         t.templates.multi_file.clear();
         assert_eq!(
             t.flat_action_template(true, false),
-            "%filename%%line% %parents%%action%"
+            "%filename%%line%%parents% %action%"
         );
     }
 

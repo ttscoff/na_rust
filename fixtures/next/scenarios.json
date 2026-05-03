@@ -54,6 +54,11 @@
       "name": "next omnifocus list",
       "fixture": "base.taskpaper",
       "args": ["--omnifocus"]
+    },
+    {
+      "name": "flat action brace escape",
+      "fixture": "flat_braces.taskpaper",
+      "args": []
     }
   ]
 }

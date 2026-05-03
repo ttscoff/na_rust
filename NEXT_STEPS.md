@@ -144,6 +144,11 @@ addressed (see snapshot above).
 - **Nested `next` parity:** **`--nest`** and **`--omnifocus`** match Ruby’s **`path:line:`**
   banners, OmniFocus trees (tabs/`@tags`), and **`diff_next`** scenarios with stable path
   normalization.
+- **Flat action text (baseline):** `%line%` includes Ruby’s trailing space; default
+  multi-file template is **`%filename%%line%%parents% %action%`**; tag body
+  highlighting uses the same tag-character class as the gem; parent slot spacing
+  differs single- vs multi-file like Ruby; **`{…}`** in action text follows Ruby’s
+  escape/unescape sequence with **`diff_next`** coverage.
 
 ## Prioritized next steps
 
@@ -154,8 +159,12 @@ Ordered roughly by impact for “feels like the gem” / reducing surprise:
    scenarios for **`--nest`** / **`--omnifocus`**. **Remaining:** optional
    `theme.duration`-style time suffixes on nested lines (if desired), and more
    fixtures for edge cases.
-2. **Flat action text parity** — Strip/format tags beyond `@na` to match Ruby in the
-   relevant modes (fixture-driven).
+2. **Flat action text parity** — **Mostly done:** `%line%` spacing, multi-file
+   template adjacency, `highlight_tags`-style `@…` tokens, parent-slot spacing,
+   Ruby-style **`{…}` escape → strip `@na` → `\{`→`{`** so brace literals match
+   `Action#pretty`, plus **`fixtures/next/flat_braces.taskpaper`** / **`diff_next`**
+   scenario. **Remaining:** exotic tag bodies (nested `{}`, values with odd `)`
+   counts) only if fixtures show a gem diff.
 3. **`update` / mutation depth** — Close gaps on interactive editor paths,
    `PATH:LINE` edge cases, and mutation ordering vs Ruby where fixtures exist.
 4. **Plugin action applications** — Ensure plugin-returned operations (`MOVE`,
