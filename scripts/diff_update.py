@@ -8,7 +8,7 @@ import sys
 import tempfile
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List
+from typing import List, Optional
 
 
 @dataclass
@@ -16,6 +16,8 @@ class Scenario:
     name: str
     fixture: str
     args: List[str]
+    # When Ruby cannot run non-interactively (fzf/gum before PATH:LINE), diff against this file.
+    expected: Optional[str] = None
 
 
 @dataclass
@@ -37,6 +39,7 @@ def read_scenarios(path: Path) -> List[Scenario]:
             name=item["name"],
             fixture=item["fixture"],
             args=item["args"],
+            expected=item.get("expected"),
         )
         for item in payload.get("scenarios", [])
     ]
@@ -90,6 +93,11 @@ def main() -> int:
         default="fixtures/update/scenarios.json",
         help="Scenario JSON file (default: fixtures/update/scenarios.json)",
     )
+    parser.add_argument(
+        "--skip-ruby",
+        action="store_true",
+        help="Only run Rust; scenarios must include \"expected\" for golden file comparison (fast CI).",
+    )
     args = parser.parse_args()
 
     repo_root = Path(__file__).resolve().parents[1]
@@ -104,7 +112,7 @@ def main() -> int:
     if not scenarios_path.is_absolute():
         scenarios_path = (repo_root / scenarios_path).resolve()
 
-    if not ruby_na.exists():
+    if not args.skip_ruby and not ruby_na.exists():
         print(f"Ruby na not found at {ruby_na}", file=sys.stderr)
         return 2
     if not rust_na.exists():
@@ -129,21 +137,77 @@ def main() -> int:
             failures += 1
             continue
 
+        if args.skip_ruby:
+            with tempfile.TemporaryDirectory(prefix="na_rust_diff_update_") as rust_tmp:
+                rust_dir = Path(rust_tmp)
+                fixture_name = Path(scenario.fixture).name
+                shutil.copy2(fixture_path, rust_dir / fixture_name)
+                rust_result = run_update(rust_na, scenario.args, rust_dir, fixture_name)
+            if not scenario.expected:
+                failures += 1
+                print(f"[FAIL] {scenario.name} (--skip-ruby requires \"expected\" in scenario)")
+                continue
+            gold_path = fixture_dir / scenario.expected
+            if not gold_path.exists():
+                failures += 1
+                print(f"[FAIL] {scenario.name} (missing golden file: {gold_path})")
+                continue
+            want = normalize(gold_path.read_text(encoding="utf-8"))
+            ok = rust_result.exit_code == 0 and rust_result.file_after == want
+            print(f"[{'PASS' if ok else 'FAIL'}] {scenario.name} (rust golden)")
+            if not ok:
+                failures += 1
+                print("  rust:")
+                print(f"    exit={rust_result.exit_code}")
+                print(f"    stdout={rust_result.stdout!r}")
+                print(f"    stderr={rust_result.stderr!r}")
+                print(f"    file={rust_result.file_after!r}")
+                print(f"  want ({gold_path}):")
+                print(f"    {want!r}")
+            continue
+
         with tempfile.TemporaryDirectory(prefix="na_rust_diff_update_") as ruby_tmp, tempfile.TemporaryDirectory(
             prefix="na_rust_diff_update_"
         ) as rust_tmp:
             ruby_dir = Path(ruby_tmp)
             rust_dir = Path(rust_tmp)
-            fixture_name = "case.taskpaper"
+            fixture_name = Path(scenario.fixture).name
             shutil.copy2(fixture_path, ruby_dir / fixture_name)
             shutil.copy2(fixture_path, rust_dir / fixture_name)
             ruby_result = run_update(ruby_na, scenario.args, ruby_dir, fixture_name)
             rust_result = run_update(rust_na, scenario.args, rust_dir, fixture_name)
 
-        if ruby_result.exit_code == 124 or rust_result.exit_code == 124:
+        if rust_result.exit_code == 124:
             skipped += 1
-            print(f"[SKIP] {scenario.name} (command timed out)")
+            print(f"[SKIP] {scenario.name} (Rust command timed out)")
             continue
+
+        if ruby_result.exit_code == 124 and scenario.expected:
+            gold_path = fixture_dir / scenario.expected
+            if not gold_path.exists():
+                failures += 1
+                print(f"[FAIL] {scenario.name} (missing golden file: {gold_path})")
+                continue
+            want = normalize(gold_path.read_text(encoding="utf-8"))
+            ok = rust_result.exit_code == 0 and rust_result.file_after == want
+            mode = "golden"
+            print(f"[{'PASS' if ok else 'FAIL'}] {scenario.name} ({mode}, Ruby timed out)")
+            if not ok:
+                failures += 1
+                print("  rust:")
+                print(f"    exit={rust_result.exit_code}")
+                print(f"    stdout={rust_result.stdout!r}")
+                print(f"    stderr={rust_result.stderr!r}")
+                print(f"    file={rust_result.file_after!r}")
+                print(f"  want ({gold_path}):")
+                print(f"    {want!r}")
+            continue
+
+        if ruby_result.exit_code == 124:
+            skipped += 1
+            print(f"[SKIP] {scenario.name} (Ruby timed out; add \"expected\" for golden fallback)")
+            continue
+
         ok = (
             ruby_result.exit_code == rust_result.exit_code
             and ruby_result.stdout == rust_result.stdout
