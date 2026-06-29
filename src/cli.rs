@@ -22,8 +22,28 @@ pub struct Cli {
     pub global_file: Option<PathBuf>,
 
     /// Disable colorized output.
-    #[arg(long, default_value_t = false)]
+    #[arg(long, default_value_t = false, global = true)]
     pub no_color: bool,
+
+    /// Colorize output (forces color even when stdout is not a TTY).
+    #[arg(long, default_value_t = false, global = true)]
+    pub color: bool,
+
+    /// Include file extension in displayed filenames.
+    #[arg(long = "include_ext", default_value_t = false, global = true)]
+    pub include_ext: bool,
+
+    /// Paginate long output when stdout is a TTY (default: enabled).
+    #[arg(long, default_value_t = true, global = true)]
+    pub pager: bool,
+
+    /// Disable pagination.
+    #[arg(long = "no-pager", default_value_t = false, global = true)]
+    pub no_pager: bool,
+
+    /// Use a todo file at the git repository root named after the repository.
+    #[arg(long = "repo-top", default_value_t = false, global = true)]
+    pub repo_top: bool,
 
     /// Tag to consider a next action.
     #[arg(short = 't', long = "na_tag", default_value = "na")]
@@ -56,6 +76,11 @@ impl Default for Cli {
             extension: "taskpaper".to_string(),
             global_file: None,
             no_color: false,
+            color: false,
+            include_ext: false,
+            pager: true,
+            no_pager: false,
+            repo_top: false,
             na_tag: "na".to_string(),
             add_at: "start".to_string(),
             depth: None,
@@ -836,8 +861,9 @@ pub enum PluginCommands {
     Run {
         #[arg(value_name = "PLUGIN")]
         plugin: String,
-        #[arg(value_name = "QUERY")]
-        query: String,
+        /// Optional query filter (Ruby `plugin run` uses `--search` / `--tagged` instead).
+        #[arg(value_name = "QUERY", num_args = 0..=1)]
+        query: Option<String>,
         #[arg(long, value_name = "TYPE")]
         input: Option<String>,
         #[arg(long, value_name = "TYPE")]
@@ -1002,9 +1028,108 @@ pub enum PromptCommands {
     Install,
 }
 
+const KNOWN_COMMANDS: &[&str] = &[
+    "next", "show", "find", "grep", "search", "tagged", "add", "update", "edit", "complete",
+    "finish", "archive", "completed", "finished", "restore", "unfinish", "move", "tag", "open",
+    "projects", "todos", "undo", "scan", "init", "create", "prompt", "changes", "changelog",
+    "saved", "initconfig", "init-config", "plugin", "help", "version",
+];
+
+const SAVED_SUBCOMMANDS: &[&str] = &["list", "run", "edit", "delete", "select"];
+
+/// Parse CLI args with Ruby-compatible rewrites (saved search dispatch, legacy `-a` add shim).
+pub fn parse_cli() -> Cli {
+    parse_from_argv(std::env::args())
+}
+
+pub fn parse_from_argv(args: impl IntoIterator<Item = impl AsRef<str>>) -> Cli {
+    let args: Vec<String> = args
+        .into_iter()
+        .map(|a| a.as_ref().to_string())
+        .collect();
+    Cli::parse_from(normalize_argv(&args))
+}
+
+fn normalize_argv(args: &[String]) -> Vec<String> {
+    let mut out = rewrite_saved_positional(args);
+    out = rewrite_unknown_single_command(&out);
+    out = rewrite_global_add_shim(&out);
+    out
+}
+
+fn split_globals_rest(args: &[String]) -> (Vec<String>, Vec<String>) {
+    let mut globals = Vec::new();
+    let mut rest = Vec::new();
+    let mut in_globals = true;
+    for arg in args.iter().skip(1) {
+        if in_globals && arg.starts_with('-') {
+            globals.push(arg.clone());
+        } else {
+            in_globals = false;
+            rest.push(arg.clone());
+        }
+    }
+    (globals, rest)
+}
+
+fn is_known_command(name: &str) -> bool {
+    KNOWN_COMMANDS
+        .iter()
+        .any(|cmd| cmd.eq_ignore_ascii_case(name))
+}
+
+fn rewrite_saved_positional(args: &[String]) -> Vec<String> {
+    let (globals, rest) = split_globals_rest(args);
+    if rest.first().map(|s| s.as_str()) != Some("saved") {
+        return args.to_vec();
+    }
+    if rest.len() >= 2 && !SAVED_SUBCOMMANDS.contains(&rest[1].as_str()) {
+        let mut new_args = vec![args[0].clone()];
+        new_args.extend(globals);
+        new_args.push("saved".into());
+        new_args.push("run".into());
+        new_args.extend(rest.into_iter().skip(1));
+        return new_args;
+    }
+    args.to_vec()
+}
+
+fn rewrite_unknown_single_command(args: &[String]) -> Vec<String> {
+    let (globals, rest) = split_globals_rest(args);
+    if rest.len() != 1 || is_known_command(&rest[0]) {
+        return args.to_vec();
+    }
+    let mut new_args = vec![args[0].clone()];
+    new_args.extend(globals);
+    new_args.push("saved".into());
+    new_args.push("run".into());
+    new_args.extend(rest);
+    new_args
+}
+
+fn rewrite_global_add_shim(args: &[String]) -> Vec<String> {
+    let (globals, rest) = split_globals_rest(args);
+    let has_add = globals.iter().any(|g| g == "-a" || g == "--add");
+    if !has_add || rest.is_empty() || is_known_command(&rest[0]) {
+        return args.to_vec();
+    }
+    if rest.len() == 1 {
+        return args.to_vec();
+    }
+    let mut new_args = vec![args[0].clone()];
+    new_args.extend(
+        globals
+            .into_iter()
+            .filter(|g| g != "-a" && g != "--add"),
+    );
+    new_args.push("add".into());
+    new_args.push(rest.join(" "));
+    new_args
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Cli, Commands};
+    use super::{parse_from_argv, Cli, Commands};
     use clap::Parser;
     use std::path::PathBuf;
 
@@ -1448,5 +1573,65 @@ mod tests {
             },
             _ => panic!("expected plugin"),
         }
+    }
+
+    #[test]
+    fn unknown_single_arg_dispatches_to_saved_run() {
+        let cli = parse_from_argv(["na", "Weekly Focus"]);
+        match cli.command {
+            Some(Commands::Saved(args)) => match args.command {
+                super::SavedCommands::Run { title } => assert_eq!(title, "Weekly Focus"),
+                _ => panic!("expected saved run"),
+            },
+            _ => panic!("expected saved"),
+        }
+    }
+
+    #[test]
+    fn saved_positional_title_rewrites_to_run() {
+        let cli = parse_from_argv(["na", "saved", "Weekly Focus"]);
+        match cli.command {
+            Some(Commands::Saved(args)) => match args.command {
+                super::SavedCommands::Run { title } => assert_eq!(title, "Weekly Focus"),
+                _ => panic!("expected saved run"),
+            },
+            _ => panic!("expected saved"),
+        }
+    }
+
+    #[test]
+    fn legacy_global_add_shim_rewrites_to_add() {
+        let cli = parse_from_argv(["na", "-a", "Buy", "milk"]);
+        match cli.command {
+            Some(Commands::Add(args)) => {
+                assert_eq!(args.text, "Buy milk");
+            }
+            _ => panic!("expected add"),
+        }
+    }
+
+    #[test]
+    fn include_ext_flag_parses() {
+        let cli = Cli::parse_from(["na", "next", "--include_ext"]);
+        assert!(cli.include_ext);
+    }
+
+    #[test]
+    fn color_flag_parses() {
+        let cli = Cli::parse_from(["na", "next", "--color"]);
+        assert!(cli.color);
+    }
+
+    #[test]
+    fn pager_and_no_pager_flags_parse() {
+        let cli = Cli::parse_from(["na", "next", "--no-pager"]);
+        assert!(!cli.pager || cli.no_pager);
+        assert!(cli.no_pager);
+    }
+
+    #[test]
+    fn repo_top_flag_parses() {
+        let cli = Cli::parse_from(["na", "--repo-top", "next"]);
+        assert!(cli.repo_top);
     }
 }

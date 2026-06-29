@@ -184,6 +184,14 @@ impl PluginRunner {
         Self { plugin }
     }
 
+    pub fn name(&self) -> &str {
+        &self.plugin.name
+    }
+
+    pub fn output_format(&self) -> PluginDataFormat {
+        self.plugin.output_format
+    }
+
     pub fn run_with_formats(
         &self,
         actions: &[Action],

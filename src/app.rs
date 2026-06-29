@@ -17,6 +17,7 @@ use crate::output::formatter::{
     color_action_body, format_action, nested_bracketed_chain, paint_themed, visual_width_tabs8,
     wrap_words, OutputStyle,
 };
+use crate::output::pager;
 use crate::output::theme::Theme;
 use crate::parser::item_path::resolve_item_path;
 use crate::parser::search::{evaluate_query, Query};
@@ -256,19 +257,23 @@ fn run_next(cli: &Cli, args: &NextArgs) -> Result<()> {
     let file_labels = if args.no_file {
         HashMap::new()
     } else {
-        build_filename_labels(&display_actions)
+        build_filename_labels(cli, &display_actions)
     };
 
     if args.nest_for_display() {
-        print_next_nested(args, &style, &display_actions, &theme);
+        let mut buf = String::new();
+        write_next_nested(&mut buf, args, &style, &display_actions, &theme);
+        print_paged(cli, buf.trim_end(), args.omnifocus);
     } else {
+        let mut buf = String::new();
         for action in &display_actions {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!(
-                "{}",
-                format_action(action, &style, file_prefix, &theme, args.no_file)
+            push_output_line(
+                &mut buf,
+                &format_action(action, &style, file_prefix, &theme, args.no_file),
             );
         }
+        print_paged(cli, buf.trim_end(), false);
     }
 
     Ok(())
@@ -437,7 +442,8 @@ fn saved_search_slug(title: &str) -> String {
 
 /// Nested `--nest` / `--omnifocus`: word-wrap body to `$COLUMNS` minus prefix visible width,
 /// including when colors are enabled (prefix may contain CSI from `[project]` brackets).
-fn print_nested_body_lines(
+fn write_nested_body_lines(
+    buf: &mut String,
     plain_body: &str,
     first_line_prefix: &str,
     style: &OutputStyle,
@@ -447,7 +453,7 @@ fn print_nested_body_lines(
     has_notes: bool,
 ) {
     let prefix_cols = visual_width_tabs8(first_line_prefix);
-    let flush_line = |i: usize, last_i: usize, chunk: &str| {
+    let mut flush_line = |i: usize, last_i: usize, chunk: &str| {
         let mut out = if i == 0 {
             format!(
                 "{}{}",
@@ -468,7 +474,7 @@ fn print_nested_body_lines(
                 out.push('*');
             }
         }
-        println!("{}", out);
+        push_output_line(buf, &out);
     };
 
     if let Some(cols) = style.wrap_width {
@@ -545,7 +551,13 @@ fn omnifocus_auxiliary_tags_suffix(action: &Action) -> String {
     }
 }
 
-fn print_next_nested(args: &NextArgs, style: &OutputStyle, matches: &[Action], theme: &Theme) {
+fn write_next_nested(
+    buf: &mut String,
+    args: &NextArgs,
+    style: &OutputStyle,
+    matches: &[Action],
+    theme: &Theme,
+) {
     // Ruby `NA::Actions.output` nest mode: file headers and `\t- [#{parent}] #{action}` / omni `output_children`
     // use **full** action text (see `na_gem/lib/na/actions.rb`). Flat `Action#pretty` alone strips `@na`.
     #[derive(Default)]
@@ -571,10 +583,14 @@ fn print_next_nested(args: &NextArgs, style: &OutputStyle, matches: &[Action], t
         }
     }
 
-    fn print_omni_tree(node: &OmniNode<'_>, level: usize, style: &OutputStyle, theme: &Theme) {
+    fn write_omni_tree(
+        buf: &mut String,
+        node: &OmniNode<'_>,
+        level: usize,
+        style: &OutputStyle,
+        theme: &Theme,
+    ) {
         let indent = "\t".repeat(level);
-        // Ruby `NA.output_children`: an `:actions` bucket is handled before sibling project keys,
-        // which advances `indent` by one tab even when that bucket is empty.
         let branch_indent = format!("{indent}\t");
         for (name, child) in &node.children {
             let header = if style.color {
@@ -585,17 +601,16 @@ fn print_next_nested(args: &NextArgs, style: &OutputStyle, matches: &[Action], t
             } else {
                 format!("{branch_indent}{name}:")
             };
-            println!("{}", header);
-            print_omni_tree(child, level + 1, style, theme);
+            push_output_line(buf, &header);
+            write_omni_tree(buf, child, level + 1, style, theme);
         }
         if !node.actions.is_empty() {
-            // Action lines use the same indent Ruby leaves after processing `:actions`
-            // (`item = "#{indent}- #{a.action}"` — no extra tab vs project headers).
             let line_indent = branch_indent.clone();
             for a in &node.actions {
                 let plain = format!("{}{}", a.text, omnifocus_auxiliary_tags_suffix(a));
                 let lead = format!("{line_indent}- ");
-                print_nested_body_lines(
+                write_nested_body_lines(
+                    buf,
                     &plain,
                     &lead,
                     style,
@@ -607,9 +622,9 @@ fn print_next_nested(args: &NextArgs, style: &OutputStyle, matches: &[Action], t
                 if style.include_notes {
                     for n in &a.notes {
                         if style.color {
-                            println!("{line_indent}\t{}", paint_themed(n, &theme.note));
+                            push_output_line(buf, &format!("{line_indent}\t{}", paint_themed(n, &theme.note)));
                         } else {
-                            println!("{line_indent}\t{n}");
+                            push_output_line(buf, &format!("{line_indent}\t{n}"));
                         }
                     }
                 }
@@ -617,29 +632,28 @@ fn print_next_nested(args: &NextArgs, style: &OutputStyle, matches: &[Action], t
         }
     }
 
-    // Mirror Ruby `NA::Actions.output`: group key is `path:line` per action, so each action gets
-    // its own `path:line:` banner (see `NA::Action#initialize`).
     for action in matches {
         let header_path = if args.omnifocus {
             nest_header_omnifocus_display(&action.source_file)
         } else {
             nest_header_source_path(&action.source_file)
         };
-        println!(
-            "{}",
-            nest_action_file_header(&header_path, action.line_index)
+        push_output_line(
+            buf,
+            &nest_action_file_header(&header_path, action.line_index),
         );
 
         if args.omnifocus {
             let mut root = OmniNode::default();
             omni_insert(&mut root, &action.project_chain, action);
-            print_omni_tree(&root, 0, style, theme);
+            write_omni_tree(buf, &root, 0, style, theme);
         } else {
             let chain = action.project_chain.join("/");
             let bracket = nested_bracketed_chain(&chain, style.color, theme);
             let plain = action.text.clone();
             let lead = format!("\t- {bracket} ");
-            print_nested_body_lines(
+            write_nested_body_lines(
+                buf,
                 &plain,
                 &lead,
                 style,
@@ -651,9 +665,9 @@ fn print_next_nested(args: &NextArgs, style: &OutputStyle, matches: &[Action], t
             if style.include_notes {
                 for note in &action.notes {
                     if style.color {
-                        println!("\t\t{}", paint_themed(note, &theme.note));
+                        push_output_line(buf, &format!("\t\t{}", paint_themed(note, &theme.note)));
                     } else {
-                        println!("\t\t{note}");
+                        push_output_line(buf, &format!("\t\t{note}"));
                     }
                 }
             }
@@ -743,7 +757,7 @@ fn render_next_time_block(cli: &Cli, args: &NextArgs, actions: &[Action]) -> Res
     let file_labels = if args.no_file {
         HashMap::new()
     } else {
-        build_filename_labels(actions)
+        build_filename_labels(cli, actions)
     };
     let flags = TimeOutputFlags {
         human: args.human,
@@ -751,7 +765,16 @@ fn render_next_time_block(cli: &Cli, args: &NextArgs, actions: &[Action]) -> Res
         only_times: args.only_times,
         json_times: args.json_times,
     };
-    render_actions_time_summary(actions, flags, &style, &theme, &file_labels, args.no_file)
+    render_actions_time_summary(
+        cli,
+        actions,
+        flags,
+        &style,
+        &theme,
+        &file_labels,
+        args.no_file,
+        args.omnifocus,
+    )
 }
 
 fn render_find_time_block(cli: &Cli, args: &FindArgs, actions: &[Action]) -> Result<()> {
@@ -769,7 +792,7 @@ fn render_find_time_block(cli: &Cli, args: &FindArgs, actions: &[Action]) -> Res
     let file_labels = if args.no_file {
         HashMap::new()
     } else {
-        build_filename_labels(actions)
+        build_filename_labels(cli, actions)
     };
     let flags = TimeOutputFlags {
         human: args.human,
@@ -777,16 +800,27 @@ fn render_find_time_block(cli: &Cli, args: &FindArgs, actions: &[Action]) -> Res
         only_times: args.only_times,
         json_times: args.json_times,
     };
-    render_actions_time_summary(actions, flags, &style, &theme, &file_labels, args.no_file)
+    render_actions_time_summary(
+        cli,
+        actions,
+        flags,
+        &style,
+        &theme,
+        &file_labels,
+        args.no_file,
+        args.omnifocus,
+    )
 }
 
 fn render_actions_time_summary(
+    cli: &Cli,
     actions: &[Action],
     flags: TimeOutputFlags,
     style: &OutputStyle,
     theme: &Theme,
     file_labels: &HashMap<String, String>,
     omit_filename: bool,
+    force_off_pager: bool,
 ) -> Result<()> {
     let mut totals_by_tag: HashMap<String, i64> = HashMap::new();
     let mut total_seconds: i64 = 0;
@@ -805,12 +839,13 @@ fn render_actions_time_summary(
         return Ok(());
     }
 
+    let mut buf = String::new();
     for action in actions {
         if flags.only_times {
             continue;
         }
         let fp = file_labels.get(&action.source_file).map(String::as_str);
-        let mut line = format_action(&action, &style, fp, theme, omit_filename);
+        let mut line = format_action(&action, style, fp, theme, omit_filename);
         if flags.inline_times {
             if let Some((_, _, secs)) = action_timing_window(action) {
                 line.push_str(" [");
@@ -818,16 +853,15 @@ fn render_actions_time_summary(
                 line.push_str("]");
             }
         }
-        println!("{}", line);
+        push_output_line(&mut buf, &line);
     }
 
     let show_footer = flags.inline_times || flags.only_times;
     if show_footer && total_seconds > 0 {
-        let mut buf = String::new();
         render_duration_footer(&mut buf, total_seconds, flags.human, &totals_by_tag)
             .map_err(|_| anyhow::anyhow!("time footer"))?;
-        print!("{}", buf);
     }
+    print_paged(cli, buf.trim_end(), force_off_pager);
     Ok(())
 }
 
@@ -1022,10 +1056,12 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
     let file_labels = if args.no_file {
         HashMap::new()
     } else {
-        build_filename_labels(&matches)
+        build_filename_labels(cli, &matches)
     };
     if args.nest_for_display() {
-        print_next_nested(
+        let mut buf = String::new();
+        write_next_nested(
+            &mut buf,
             &NextArgs {
                 nest: args.nest,
                 omnifocus: args.omnifocus,
@@ -1035,14 +1071,17 @@ fn run_find(cli: &Cli, args: &FindArgs) -> Result<()> {
             &matches,
             &theme,
         );
+        print_paged(cli, buf.trim_end(), args.omnifocus);
     } else {
+        let mut buf = String::new();
         for action in matches {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!(
-                "{}",
-                format_action(&action, &style, file_prefix, &theme, args.no_file)
+            push_output_line(
+                &mut buf,
+                &format_action(&action, &style, file_prefix, &theme, args.no_file),
             );
         }
+        print_paged(cli, buf.trim_end(), false);
     }
     Ok(())
 }
@@ -1205,10 +1244,12 @@ fn run_completed(cli: &Cli, args: &CompletedArgs) -> Result<()> {
     let file_labels = if args.no_file {
         HashMap::new()
     } else {
-        build_filename_labels(&matches)
+        build_filename_labels(cli, &matches)
     };
     if args.nest_for_display() {
-        print_next_nested(
+        let mut buf = String::new();
+        write_next_nested(
+            &mut buf,
             &NextArgs {
                 nest: args.nest,
                 omnifocus: args.omnifocus,
@@ -1218,14 +1259,17 @@ fn run_completed(cli: &Cli, args: &CompletedArgs) -> Result<()> {
             &matches,
             &theme,
         );
+        print_paged(cli, buf.trim_end(), args.omnifocus);
     } else {
+        let mut buf = String::new();
         for action in matches {
             let file_prefix = file_labels.get(&action.source_file).map(String::as_str);
-            println!(
-                "{}",
-                format_action(&action, &style, file_prefix, &theme, args.no_file)
+            push_output_line(
+                &mut buf,
+                &format_action(&action, &style, file_prefix, &theme, args.no_file),
             );
         }
+        print_paged(cli, buf.trim_end(), false);
     }
     Ok(())
 }
@@ -1321,8 +1365,27 @@ fn completed_matches_date(
     }
 }
 
+fn pager_enabled(cli: &Cli, force_off: bool) -> bool {
+    cli.pager && !cli.no_pager && pager::should_paginate(true, force_off)
+}
+
+fn print_paged(cli: &Cli, text: &str, force_off: bool) {
+    pager::page(text, pager_enabled(cli, force_off));
+}
+
+fn push_output_line(buf: &mut String, line: &str) {
+    buf.push_str(line);
+    buf.push('\n');
+}
+
 fn output_color_enabled(cli: &Cli) -> bool {
-    !cli.no_color && std::io::stdout().is_terminal()
+    if cli.no_color {
+        return false;
+    }
+    if cli.color {
+        return true;
+    }
+    std::io::stdout().is_terminal()
 }
 
 /// Terminal width from `$COLUMNS` when stdout is a TTY.
@@ -1337,7 +1400,7 @@ fn output_wrap_columns(_cli: &Cli) -> Option<usize> {
     std::env::var("COLUMNS").ok()?.parse().ok()
 }
 
-fn build_filename_labels(actions: &[Action]) -> HashMap<String, String> {
+fn build_filename_labels(cli: &Cli, actions: &[Action]) -> HashMap<String, String> {
     let files: HashSet<&str> = actions.iter().map(|a| a.source_file.as_str()).collect();
     if files.len() <= 1 {
         return HashMap::new();
@@ -1358,13 +1421,25 @@ fn build_filename_labels(actions: &[Action]) -> HashMap<String, String> {
         .iter()
         .map(|action| {
             let path = Path::new(&action.source_file);
-            let label = abbreviate_source_path(path, cwd.as_deref(), has_subdir);
+            let label = abbreviate_source_path(
+                path,
+                cwd.as_deref(),
+                has_subdir,
+                cli.include_ext,
+                &cli.extension,
+            );
             (action.source_file.clone(), label)
         })
         .collect()
 }
 
-fn abbreviate_source_path(path: &Path, cwd: Option<&Path>, show_cwd_indicator: bool) -> String {
+fn abbreviate_source_path(
+    path: &Path,
+    cwd: Option<&Path>,
+    show_cwd_indicator: bool,
+    include_ext: bool,
+    extension: &str,
+) -> String {
     if let Some(cwd) = cwd {
         if let Ok(relative) = path.strip_prefix(cwd) {
             let rel = relative.to_string_lossy().to_string();
@@ -1382,7 +1457,17 @@ fn abbreviate_source_path(path: &Path, cwd: Option<&Path>, show_cwd_indicator: b
             out = out.replacen(home_str.as_ref(), "~", 1);
         }
     }
+    if !include_ext {
+        out = strip_file_extension_suffix(&out, extension);
+    }
     out
+}
+
+fn strip_file_extension_suffix(path: &str, extension: &str) -> String {
+    let suffix = format!(".{extension}");
+    path.strip_suffix(&suffix)
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn find_actions(files: &[TodoFile], query: &str) -> Result<Vec<Action>> {
@@ -3249,7 +3334,7 @@ fn run_saved(command: &SavedCommands) -> Result<()> {
         SavedCommands::Run { title } => {
             let path = saved_search_path(title)?;
             if !path.exists() {
-                anyhow::bail!("Saved search not found: {title}");
+                anyhow::bail!("Search {title} not found");
             }
             let script = fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read saved search {:?}", path))?;
@@ -3270,7 +3355,7 @@ fn run_saved(command: &SavedCommands) -> Result<()> {
         SavedCommands::Edit { title, editor } => {
             let path = saved_search_path(title)?;
             if !path.exists() {
-                anyhow::bail!("Saved search not found: {title}");
+                anyhow::bail!("Search {title} not found");
             }
             let editor_cmd = editor
                 .clone()
@@ -3288,7 +3373,7 @@ fn run_saved(command: &SavedCommands) -> Result<()> {
         SavedCommands::Delete { title } => {
             let path = saved_search_path(title)?;
             if !path.exists() {
-                anyhow::bail!("Saved search not found: {title}");
+                anyhow::bail!("Search {title} not found");
             }
             fs::remove_file(&path).with_context(|| format!("Failed to remove {:?}", path))?;
             println!("Deleted saved search {title}");
@@ -3364,7 +3449,7 @@ fn run_plugin(cli: &Cli, command: &PluginCommands) -> Result<()> {
             done,
             tagged,
         } => {
-            let files = if let Some(path) = file {
+            let mut files = if let Some(path) = file {
                 vec![TodoFile::load(path)?]
             } else if let Some(path) = &cli.global_file {
                 vec![TodoFile::load(path)?]
@@ -3383,8 +3468,20 @@ fn run_plugin(cli: &Cli, command: &PluginCommands) -> Result<()> {
                     .map(|p| TodoFile::load(p))
                     .collect::<Result<Vec<_>, _>>()?
             };
-            let q = Query::parse(query)?;
-            let mut actions = evaluate_query(&files, &q);
+            let mut actions = if let Some(q) = query.as_deref().filter(|s| !s.is_empty()) {
+                evaluate_query(&files, &Query::parse(q)?)
+            } else {
+                files
+                    .iter()
+                    .flat_map(|f| {
+                        f.actions().into_iter().filter(|a| *done || !a.done).map(|a| {
+                            let mut action = a.clone();
+                            action.source_file = f.path.display().to_string();
+                            action
+                        })
+                    })
+                    .collect()
+            };
             if !search.is_empty() {
                 let needle = search.join(" ").to_ascii_lowercase();
                 actions.retain(|a| a.text.to_ascii_lowercase().contains(&needle));
@@ -3404,14 +3501,22 @@ fn run_plugin(cli: &Cli, command: &PluginCommands) -> Result<()> {
             if !done {
                 actions.retain(|a| !a.done);
             }
+            if actions.is_empty() {
+                anyhow::bail!("No matching actions found");
+            }
             let runner = registry.plugin(plugin)?;
-            let output = runner.run_with_formats(
+            let in_fmt = input.as_deref().and_then(PluginDataFormat::parse);
+            let out_fmt = output.as_deref().and_then(PluginDataFormat::parse);
+            let stdout = runner.run_with_formats(&actions, in_fmt, out_fmt, divider.as_deref())?;
+            let effective_out = out_fmt.unwrap_or_else(|| runner.output_format());
+            let total = apply_plugin_stdout_to_files(
+                &mut files,
                 &actions,
-                input.as_deref().and_then(PluginDataFormat::parse),
-                output.as_deref().and_then(PluginDataFormat::parse),
+                &stdout,
+                effective_out,
                 divider.as_deref(),
             )?;
-            println!("{output}");
+            println!("Updated {total} action(s) via plugin {}", runner.name());
             Ok(())
         }
         PluginCommands::Enable { plugin } => {
@@ -4250,8 +4355,8 @@ ProjectB:
         let root_file = Path::new("/tmp/workspace/todo.taskpaper");
         let nested_file = Path::new("/tmp/workspace/sub/todo.taskpaper");
 
-        let root = abbreviate_source_path(root_file, Some(cwd), true);
-        let nested = abbreviate_source_path(nested_file, Some(cwd), true);
+        let root = abbreviate_source_path(root_file, Some(cwd), true, false, "taskpaper");
+        let nested = abbreviate_source_path(nested_file, Some(cwd), true, false, "taskpaper");
 
         assert_eq!(root, "./todo.taskpaper");
         assert_eq!(nested, "sub/todo.taskpaper");
@@ -5432,7 +5537,7 @@ Inbox:
             &cli,
             &PluginCommands::Run {
                 plugin: "echo_json".to_string(),
-                query: "@na".to_string(),
+                query: Some("@na".to_string()),
                 input: None,
                 output: None,
                 divider: None,

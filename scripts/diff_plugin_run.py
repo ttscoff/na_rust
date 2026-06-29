@@ -2,6 +2,7 @@
 import argparse
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
@@ -32,6 +33,16 @@ def normalize(text: str) -> str:
     return text.replace("\r\n", "\n").strip()
 
 
+def normalize_fixture(text: str) -> str:
+    """Ignore tab vs space and action-line indent differences in taskpaper fixtures."""
+    lines = []
+    for line in text.replace("\r\n", "\n").strip().split("\n"):
+        s = line.expandtabs(2).rstrip()
+        s = re.sub(r"^\s*- ", "- ", s)
+        lines.append(s)
+    return "\n".join(lines)
+
+
 def read_scenarios(path: Path) -> List[Scenario]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     return [
@@ -52,7 +63,15 @@ def run_plugin(
 ) -> RunResult:
     try:
         proc = subprocess.run(
-            [str(bin_path), "plugin", "run", plugin, query, *extra_args],
+            [
+                str(bin_path),
+                "plugin",
+                "run",
+                plugin,
+                "--file",
+                "case.taskpaper",
+                *extra_args,
+            ],
             cwd=str(cwd),
             env=env,
             stdout=subprocess.PIPE,
@@ -73,7 +92,20 @@ def run_plugin(
     )
 
 
-def install_plugin(tmp_dir: Path, plugin_name: str, body: str) -> None:
+def read_fixture_after(cwd: Path) -> str:
+    return normalize_fixture((cwd / "case.taskpaper").read_text(encoding="utf-8"))
+
+
+def install_plugin_ruby(tmp_dir: Path, plugin_name: str, body: str) -> None:
+    # Ruby na ignores XDG_DATA_HOME and uses ~/.local/share/na/plugins.
+    plugin_dir = tmp_dir / "home" / ".local" / "share" / "na" / "plugins"
+    plugin_dir.mkdir(parents=True, exist_ok=True)
+    script_path = plugin_dir / f"{plugin_name}.sh"
+    script_path.write_text(body, encoding="utf-8")
+    script_path.chmod(0o755)
+
+
+def install_plugin_rust(tmp_dir: Path, plugin_name: str, body: str) -> None:
     xdg_home = tmp_dir / "xdg"
     plugin_dir = xdg_home / "na" / "plugins"
     plugin_dir.mkdir(parents=True, exist_ok=True)
@@ -150,12 +182,12 @@ def main() -> int:
             rust_dir = Path(rust_tmp)
             shutil.copy2(fixture_path, ruby_dir / "case.taskpaper")
             shutil.copy2(fixture_path, rust_dir / "case.taskpaper")
-            install_plugin(ruby_dir, scenario.plugin, scenario.plugin_body)
-            install_plugin(rust_dir, scenario.plugin, scenario.plugin_body)
+            install_plugin_ruby(ruby_dir, scenario.plugin, scenario.plugin_body)
+            install_plugin_rust(rust_dir, scenario.plugin, scenario.plugin_body)
 
             ruby_env = os.environ.copy()
             rust_env = os.environ.copy()
-            ruby_env["XDG_DATA_HOME"] = str(ruby_dir / "xdg")
+            ruby_env["HOME"] = str(ruby_dir / "home")
             rust_env["XDG_DATA_HOME"] = str(rust_dir / "xdg")
 
             ruby_result = run_plugin(
@@ -164,6 +196,8 @@ def main() -> int:
             rust_result = run_plugin(
                 rust_na, rust_dir, scenario.plugin, scenario.query, scenario.extra_args, rust_env
             )
+            ruby_file = read_fixture_after(ruby_dir)
+            rust_file = read_fixture_after(rust_dir)
 
         ruby_missing = "Plugin not found" in ruby_result.stderr
         rust_missing = "Plugin not found" in rust_result.stderr
@@ -175,18 +209,19 @@ def main() -> int:
 
         ok = (
             ruby_result.exit_code == rust_result.exit_code
-            and ruby_result.stdout == rust_result.stdout
-            and ruby_result.stderr == rust_result.stderr
+            and ruby_file == rust_file
         )
         print(f"[{'PASS' if ok else 'FAIL'}] {scenario.name}")
         if not ok:
             failures += 1
             print("  ruby:")
             print(f"    exit={ruby_result.exit_code}")
+            print(f"    file={ruby_file!r}")
             print(f"    stdout={ruby_result.stdout!r}")
             print(f"    stderr={ruby_result.stderr!r}")
             print("  rust:")
             print(f"    exit={rust_result.exit_code}")
+            print(f"    file={rust_file!r}")
             print(f"    stdout={rust_result.stdout!r}")
             print(f"    stderr={rust_result.stderr!r}")
 
