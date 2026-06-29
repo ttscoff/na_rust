@@ -25,8 +25,45 @@ pub struct Cli {
     #[arg(long, default_value_t = false)]
     pub no_color: bool,
 
+    /// Tag to consider a next action.
+    #[arg(short = 't', long = "na_tag", default_value = "na")]
+    pub na_tag: String,
+
+    /// Add new/moved entries at start or end of target project.
+    #[arg(long = "add_at", default_value = "start")]
+    pub add_at: String,
+
+    /// Recurse to depth when discovering todo files (global default).
+    #[arg(short = 'd', long = "depth")]
+    pub depth: Option<usize>,
+
+    /// Template for new/blank todo files.
+    #[arg(long)]
+    pub template: Option<String>,
+
+    /// Use cwd as project, tag, or none when using a global file.
+    #[arg(long = "cwd_as", default_value = "none")]
+    pub cwd_as: String,
+
     #[command(subcommand)]
     pub command: Option<Commands>,
+}
+
+impl Default for Cli {
+    fn default() -> Self {
+        Self {
+            version: false,
+            extension: "taskpaper".to_string(),
+            global_file: None,
+            no_color: false,
+            na_tag: "na".to_string(),
+            add_at: "start".to_string(),
+            depth: None,
+            template: None,
+            cwd_as: "none".to_string(),
+            command: None,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -80,8 +117,18 @@ pub enum Commands {
     Changes,
     /// Manage saved `next` search definitions.
     Saved(SavedArgs),
+    /// Initialize the config file using current global options.
+    #[command(name = "initconfig", visible_alias = "init-config")]
+    InitConfig(InitConfigArgs),
     /// Inspect or run plugins.
     Plugin(PluginArgs),
+}
+
+#[derive(Debug, Args)]
+pub struct InitConfigArgs {
+    /// Overwrite an existing config file.
+    #[arg(long, default_value_t = false)]
+    pub force: bool,
 }
 
 #[derive(Debug, Clone, Args)]
@@ -419,8 +466,8 @@ pub struct AddArgs {
     pub finish: bool,
 
     /// Search for files this many directories deep.
-    #[arg(short = 'd', long = "depth", default_value_t = 1)]
-    pub depth: usize,
+    #[arg(short = 'd', long = "depth")]
+    pub depth: Option<usize>,
 
     /// Include stdin note lines when provided.
     #[arg(short = 'n', long = "note", default_value_t = false)]
@@ -554,6 +601,22 @@ pub struct UpdateArgs {
     /// Set duration tag value.
     #[arg(long = "duration", value_name = "DURATION")]
     pub duration: Option<String>,
+
+    /// Run a plugin on selected actions and persist results (Ruby `update --plugin`).
+    #[arg(long, value_name = "NAME")]
+    pub plugin: Option<String>,
+
+    /// Plugin stdin format (json|yaml|csv|text).
+    #[arg(long, value_name = "TYPE")]
+    pub input: Option<String>,
+
+    /// Plugin stdout format (json|yaml|csv|text).
+    #[arg(long, value_name = "TYPE")]
+    pub output: Option<String>,
+
+    /// Divider string for text-divider plugin I/O.
+    #[arg(long, value_name = "STRING")]
+    pub divider: Option<String>,
 }
 
 #[derive(Debug, Args, Clone)]
@@ -1060,7 +1123,7 @@ mod tests {
                 assert!(args.no_next_tag);
                 assert_eq!(args.file, Some(PathBuf::from("tasks.taskpaper")));
                 assert!(args.finish);
-                assert_eq!(args.depth, 3);
+                assert_eq!(args.depth, Some(3));
                 assert!(args.note);
             }
             _ => panic!("expected add"),
@@ -1300,6 +1363,61 @@ mod tests {
             },
             _ => panic!("expected saved"),
         }
+    }
+
+    #[test]
+    fn update_plugin_flags_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "update",
+            "--plugin",
+            "fmt",
+            "--input",
+            "json",
+            "--output",
+            "yaml",
+            "--divider",
+            "||",
+            "--all",
+            "needle",
+        ]);
+        match cli.command {
+            Some(Commands::Update(args)) => {
+                assert_eq!(args.plugin.as_deref(), Some("fmt"));
+                assert_eq!(args.input.as_deref(), Some("json"));
+                assert_eq!(args.output.as_deref(), Some("yaml"));
+                assert_eq!(args.divider.as_deref(), Some("||"));
+                assert!(args.all);
+                assert_eq!(args.query.as_deref(), Some("needle"));
+            }
+            _ => panic!("expected update"),
+        }
+    }
+
+    #[test]
+    fn initconfig_force_flag_parses() {
+        let cli = Cli::parse_from(["na", "initconfig", "--force"]);
+        match cli.command {
+            Some(Commands::InitConfig(args)) => assert!(args.force),
+            _ => panic!("expected initconfig"),
+        }
+    }
+
+    #[test]
+    fn global_na_tag_and_add_at_parse() {
+        let cli = Cli::parse_from([
+            "na",
+            "--na_tag",
+            "next",
+            "--add_at",
+            "end",
+            "--depth",
+            "2",
+            "next",
+        ]);
+        assert_eq!(cli.na_tag, "next");
+        assert_eq!(cli.add_at, "end");
+        assert_eq!(cli.depth, Some(2));
     }
 
     #[test]

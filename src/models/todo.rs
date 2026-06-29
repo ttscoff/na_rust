@@ -2,6 +2,7 @@ use crate::io::fs::backup_path;
 use crate::models::action::Action;
 #[cfg(test)]
 use crate::parser::search::Query;
+use crate::parser::expand_date_tags_in_line;
 use crate::parser::taskpaper::{extract_actions, render_lines};
 use anyhow::{Context, Result};
 use chrono::Local;
@@ -81,6 +82,18 @@ impl TodoFile {
         notes: &[String],
         append: bool,
     ) {
+        self.insert_action(project, text, notes, append, false);
+    }
+
+    /// Insert an action under `project`. When `tab_indent` is true, the line is `\t- …` (Ruby `update_action` style).
+    pub fn insert_action(
+        &mut self,
+        project: Option<&str>,
+        text: &str,
+        notes: &[String],
+        append: bool,
+        tab_indent: bool,
+    ) {
         let project_name = project
             .map(str::trim)
             .filter(|s| !s.is_empty())
@@ -105,7 +118,12 @@ impl TodoFile {
             proj_idx + 1
         };
 
-        self.lines.insert(insert_idx, format!("- {text}"));
+        let action_line = if tab_indent {
+            format!("\t- {text}")
+        } else {
+            format!("- {text}")
+        };
+        self.lines.insert(insert_idx, action_line);
         for (i, note) in notes.iter().enumerate() {
             self.lines.insert(insert_idx + 1 + i, format!("\t{note}"));
         }
@@ -130,7 +148,7 @@ impl TodoFile {
             if let Some(line) = self.lines.get_mut(action.line_index) {
                 let before = line.clone();
                 if done {
-                    apply_done_timestamp(line);
+                    *line = apply_done_timestamp_to_text(line);
                 }
                 for tag in tags {
                     if !line.contains(tag) {
@@ -154,6 +172,7 @@ impl TodoFile {
         Ok(changed)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only called from `#[cfg(test)]` in this module
     pub fn apply_update_by_lines(
         &mut self,
         line_indices: &HashSet<usize>,
@@ -234,12 +253,21 @@ impl TodoFile {
             notes.retain(|n| !n.trim().is_empty());
 
             self.lines.drain(start..end);
-            self.add_action(
-                Some(&project),
-                &text,
-                &notes,
-                mutation.append_to_project_end,
-            );
+            if mutation.move_to_project.is_some() || mutation.restore {
+                self.insert_action(
+                    Some(&project),
+                    &text,
+                    &notes,
+                    mutation.append_to_project_end,
+                    true,
+                );
+            } else {
+                // Reinsert at the original line index (bottom-up order keeps indices stable).
+                self.lines.insert(start, format!("\t- {text}"));
+                for (i, note) in notes.iter().enumerate() {
+                    self.lines.insert(start + 1 + i, format!("\t{note}"));
+                }
+            }
             changed += 1;
         }
         if changed > 0 {
@@ -248,6 +276,7 @@ impl TodoFile {
         Ok(changed)
     }
 
+    #[cfg_attr(not(test), allow(dead_code))] // only called from `#[cfg(test)]` in this module
     pub fn archive_actions_by_lines(&mut self, line_indices: &HashSet<usize>) -> Result<usize> {
         self.archive_actions_by_lines_with_options(line_indices, &[], false)
     }
@@ -301,6 +330,38 @@ impl TodoFile {
         Ok(line_indices.len())
     }
 
+    /// Replace whole task blocks (action line + note lines) using plugin-merged actions.
+    /// `updates` pairs `(original_line_index, merged_action)`; must be applied bottom-up so indices
+    /// stay valid when multiple rows in one file change.
+    pub fn replace_action_blocks_from_plugin(
+        &mut self,
+        updates: &[(usize, Action)],
+    ) -> Result<usize> {
+        if updates.is_empty() {
+            return Ok(0);
+        }
+        let mut pairs: Vec<(usize, Action)> = updates.to_vec();
+        pairs.sort_by(|a, b| b.0.cmp(&a.0));
+        let mut changed = 0usize;
+        for (line_idx, new_action) in pairs {
+            let actions = self.actions();
+            let Some(cur) = actions.iter().find(|a| a.line_index == line_idx) else {
+                continue;
+            };
+            let start = cur.line_index;
+            let end = (start + 1 + cur.notes.len()).min(self.lines.len());
+            self.lines.drain(start..end);
+            let project = new_action.project.as_deref().unwrap_or("Inbox");
+            let text = expand_date_tags_in_line(&new_action.text);
+            self.add_action(Some(project), &text, &new_action.notes, true);
+            changed += 1;
+        }
+        if changed > 0 {
+            self.save()?;
+        }
+        Ok(changed)
+    }
+
     pub fn save(&self) -> Result<()> {
         if self.path.exists() {
             let backup = backup_path(&self.path);
@@ -331,10 +392,6 @@ fn remove_tag_from_line(line: &mut String, tag: &str) {
     let updated = re.replace_all(line, "").to_string();
     let compact = updated.split_whitespace().collect::<Vec<_>>().join(" ");
     *line = compact;
-}
-
-fn apply_done_timestamp(line: &mut String) {
-    *line = apply_done_timestamp_to_text(line);
 }
 
 fn apply_done_timestamp_to_text(text: &str) -> String {
@@ -372,6 +429,7 @@ fn leading_whitespace(line: &str) -> usize {
 #[cfg(test)]
 mod tests {
     use super::TodoFile;
+    use crate::models::action::Action;
     use crate::io::fs::backup_path;
     use crate::parser::search::Query;
     use std::collections::HashSet;
@@ -421,6 +479,40 @@ mod tests {
         assert!(updated.contains("- Task one @done("), "{updated}");
         assert!(updated.contains("@today"), "{updated}");
         assert!(updated.contains("- Task two @done\n"));
+    }
+
+    #[test]
+    fn replace_action_blocks_from_plugin_updates_text_and_notes() {
+        let path = write_fixture_taskpaper(
+            r#"Work:
+- Original @na
+"#,
+        );
+        let mut todo = TodoFile::load(&path).expect("fixture should load");
+        let actions = todo.actions();
+        let a = &actions[0];
+        let merged = Action {
+            text: "Updated @na".to_string(),
+            line_index: a.line_index,
+            project: a.project.clone(),
+            project_chain: a.project_chain.clone(),
+            notes: vec!["note line".to_string()],
+            tags: vec![],
+            tag_values: Default::default(),
+            done: false,
+            due: None,
+            source_file: a.source_file.clone(),
+        };
+        let backup = backup_path(&path);
+        let n = todo
+            .replace_action_blocks_from_plugin(&[(a.line_index, merged)])
+            .expect("replace");
+        let updated = fs::read_to_string(&path).expect("read");
+        fs::remove_file(path).ok();
+        fs::remove_file(backup).ok();
+        assert_eq!(n, 1);
+        assert!(updated.contains("- Updated @na"), "{updated}");
+        assert!(updated.contains("\tnote line"), "{updated}");
     }
 
     #[test]

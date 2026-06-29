@@ -9,7 +9,10 @@ mod plugins;
 use anyhow::Result;
 use clap::Parser;
 
+use io::config::apply_rc_defaults;
+
 fn main() -> Result<()> {
-    let cli = cli::Cli::parse();
+    let mut cli = cli::Cli::parse();
+    apply_rc_defaults(&mut cli);
     app::run(cli)
 }

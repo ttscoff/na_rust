@@ -333,8 +333,7 @@ fn apply_text_tags_from_strings(
     Ok(())
 }
 
-/// Match Ruby: strip `@tag` / `@tag(...)` from text, then append tags from `{name, value}` objects.
-fn merge_text_with_plugin_tag_objects(text: &str, tag_objs: &[Value]) -> Result<String> {
+pub(crate) fn merge_text_with_plugin_tag_objects(text: &str, tag_objs: &[Value]) -> Result<String> {
     let stripped = strip_inline_taskpaper_tags(text);
     let extra = format_plugin_tag_objects(tag_objs)?;
     Ok(if extra.is_empty() {
@@ -598,7 +597,7 @@ fn parse_kv_line(line: &str) -> Option<(String, String)> {
         .map(|(k, v)| (k.trim().to_string(), v.trim().to_string()))
 }
 
-fn paths_match(a: &str, b: &str) -> bool {
+pub(crate) fn paths_match(a: &str, b: &str) -> bool {
     normalize_path(a) == normalize_path(b)
 }
 

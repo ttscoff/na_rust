@@ -23,6 +23,7 @@ pub(crate) fn action_timing_window(action: &Action) -> Option<(DateTime<Utc>, Da
     }
 }
 
+#[cfg(test)]
 #[inline]
 pub(crate) fn action_elapsed_seconds(action: &Action) -> Option<i64> {
     action_timing_window(action).map(|(_, _, s)| s)

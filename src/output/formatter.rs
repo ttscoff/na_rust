@@ -18,10 +18,10 @@ fn tag_token_regex() -> &'static Regex {
     })
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct OutputStyle {
     pub color: bool,
-    pub na_tag: &'static str,
+    pub na_tag: String,
     pub include_notes: bool,
     /// When set, nested modes wrap action bodies to this terminal width (`$COLUMNS`). Flat lists
     /// only use wrap when **`color`** is false (single long line under full color themes).
@@ -32,7 +32,7 @@ impl Default for OutputStyle {
     fn default() -> Self {
         Self {
             color: false,
-            na_tag: "na",
+            na_tag: "na".to_string(),
             include_notes: false,
             wrap_width: None,
         }
@@ -334,13 +334,13 @@ pub(crate) fn nested_bracketed_chain(chain: &str, style_color: bool, theme: &The
 /// When notes exist but `include_notes` is false, appends `*` (Ruby `template[:note]*`).
 pub fn format_action(
     action: &Action,
-    style: OutputStyle,
+    style: &OutputStyle,
     filename_prefix: Option<&str>,
     theme: &Theme,
     omit_filename: bool,
 ) -> String {
     let escaped = escape_curly_groups_like_ruby_action_pretty(action.text.as_str());
-    let plain_body = strip_na_token(escaped, style.na_tag);
+    let plain_body = strip_na_token(escaped, &style.na_tag);
 
     // Ruby `Action#pretty` builds `line_num` as `:#{@line} ` (trailing space before reset).
     let line_body = format!(":{} ", action.line_index);
@@ -517,7 +517,7 @@ mod tests {
     fn formats_multi_file_line_before_project_like_ruby_theme() {
         let out = format_action(
             &sample_action(),
-            OutputStyle {
+            &OutputStyle {
                 wrap_width: None,
                 ..Default::default()
             },
@@ -535,7 +535,7 @@ mod tests {
     fn formats_without_filename_prefix() {
         let out = format_action(
             &sample_action(),
-            OutputStyle {
+            &OutputStyle {
                 wrap_width: None,
                 ..Default::default()
             },
@@ -552,7 +552,7 @@ mod tests {
         a.notes = vec!["Note line".to_string()];
         let out = format_action(
             &a,
-            OutputStyle {
+            &OutputStyle {
                 include_notes: false,
                 wrap_width: None,
                 ..Default::default()
@@ -597,7 +597,7 @@ mod tests {
         };
         let out = format_action(
             &a,
-            OutputStyle {
+            &OutputStyle {
                 wrap_width: None,
                 ..Default::default()
             },
@@ -646,7 +646,7 @@ mod tests {
         theme.templates.single_file = "%line% %parents%%action%".to_string();
         let out = format_action(
             &sample_action(),
-            OutputStyle {
+            &OutputStyle {
                 wrap_width: None,
                 ..Default::default()
             },
@@ -696,7 +696,7 @@ mod tests {
         theme.templates.output = "%project% %line% %action%".to_string();
         let out = format_action(
             &sample_action(),
-            OutputStyle {
+            &OutputStyle {
                 wrap_width: None,
                 ..Default::default()
             },
@@ -713,7 +713,7 @@ mod tests {
         theme.templates.no_file = "[%action%]%line%".to_string();
         let out = format_action(
             &sample_action(),
-            OutputStyle {
+            &OutputStyle {
                 wrap_width: None,
                 ..Default::default()
             },
@@ -731,7 +731,7 @@ mod tests {
         theme.parent = "{c}".to_string();
         let out = format_action(
             &sample_action(),
-            OutputStyle {
+            &OutputStyle {
                 color: true,
                 wrap_width: None,
                 ..Default::default()

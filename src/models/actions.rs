@@ -20,7 +20,7 @@ pub fn first_available_per_project(
             continue;
         }
 
-        let key = action.project.clone().unwrap_or_default();
+        let key = action.project_chain.join(":");
         if key.trim().is_empty() || seen.contains(&key) {
             continue;
         }

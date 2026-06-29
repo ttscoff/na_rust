@@ -184,10 +184,6 @@ impl PluginRunner {
         Self { plugin }
     }
 
-    pub fn run(&self, actions: &[Action]) -> Result<String> {
-        self.run_with_formats(actions, None, None, None)
-    }
-
     pub fn run_with_formats(
         &self,
         actions: &[Action],
