@@ -2,7 +2,7 @@ use crate::cli::{
     AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, InitConfigArgs,
     MoveArgs, NextArgs,
     OpenArgs, PluginCommands, ProjectsArgs, PromptArgs, PromptCommands, SavedCommands, ScanArgs,
-    TagArgs, TaggedArgs, TodosArgs, UndoArgs, UpdateArgs,
+    TagArgs, TaggedArgs, TodosArgs, UndoArgs, UpdateArgs, legacy_global_add_extras_from_argv,
 };
 use crate::io::fs::{discover_taskpaper_files, discover_taskpaper_files_with_options};
 use crate::io::config::{find_na_rc_path, rc_globals_from_cli, write_na_rc};
@@ -49,15 +49,31 @@ fn effective_add_at<'a>(cli: &'a Cli, cmd_at: Option<&'a str>) -> &'a str {
     cmd_at.unwrap_or(cli.add_at.as_str())
 }
 
+fn global_depth_is_default(cli: &Cli) -> bool {
+    cli.depth.unwrap_or(1) == 1
+}
+
 fn effective_discovery_depth(cli: &Cli, cmd_depth: Option<usize>, default: usize) -> usize {
+    if cli.recurse && cmd_depth.is_none() && global_depth_is_default(cli) {
+        return 3;
+    }
     cmd_depth.or(cli.depth).unwrap_or(default)
 }
 
 fn effective_discovery_depth_usize(cli: &Cli, cmd_depth: usize, default: usize) -> usize {
+    if cli.recurse && cmd_depth == default && global_depth_is_default(cli) {
+        return 3;
+    }
     if cmd_depth != default {
         cmd_depth
     } else {
         cli.depth.unwrap_or(default)
+    }
+}
+
+fn debug_notify(cli: &Cli, msg: &str) {
+    if cli.debug {
+        eprintln!("{msg}");
     }
 }
 
@@ -149,6 +165,13 @@ pub fn run(cli: Cli) -> Result<()> {
         println!("na (Rust version) {}", env!("CARGO_PKG_VERSION"));
         return Ok(());
     }
+    debug_notify(
+        &cli,
+        &format!(
+            "globals: extension={}, depth={:?}, recurse={}, add={}",
+            cli.extension, cli.depth, cli.recurse, cli.add
+        ),
+    );
 
     match &cli.command {
         Some(Commands::Next(args)) => run_next(&cli, args),
@@ -174,7 +197,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::Scan(args)) => run_scan(&cli, args),
         Some(Commands::Init) => run_init(&cli),
         Some(Commands::Prompt(args)) => run_prompt(&cli, args),
-        Some(Commands::Changes) => run_changes(),
+        Some(Commands::Changes) => run_changes(&cli),
         Some(Commands::Saved(args)) => run_saved(&args.command),
         Some(Commands::InitConfig(args)) => run_initconfig(&cli, args),
         Some(Commands::Plugin(args)) => run_plugin(&cli, &args.command),
@@ -229,6 +252,9 @@ struct TimeOutputFlags {
 }
 
 fn run_next(cli: &Cli, args: &NextArgs) -> Result<()> {
+    if cli.add {
+        return run_legacy_global_add(cli, args);
+    }
     if let Some(title) = args.save.as_deref() {
         save_next_search(args, title)?;
     }
@@ -2721,12 +2747,37 @@ fn run_prompt(cli: &Cli, args: &PromptArgs) -> Result<()> {
     }
 }
 
-fn run_changes() -> Result<()> {
+fn run_legacy_global_add(cli: &Cli, next_args: &NextArgs) -> Result<()> {
+    let text = next_args
+        .filter
+        .clone()
+        .context("No action specified")?;
+    let (note, priority) = legacy_global_add_extras_from_argv();
+    let add_args = AddArgs {
+        text,
+        started: None,
+        end: None,
+        duration: None,
+        project: "Inbox".to_string(),
+        at: None,
+        in_todo: Vec::new(),
+        priority,
+        tag: None,
+        no_next_tag: false,
+        file: None,
+        finish: false,
+        depth: None,
+        note,
+    };
+    run_add(cli, &add_args)
+}
+
+fn run_changes(cli: &Cli) -> Result<()> {
     let changelog = PathBuf::from("CHANGELOG.md");
     if !changelog.exists() {
         anyhow::bail!("CHANGELOG.md not found");
     }
-    print!("{}", fs::read_to_string(changelog)?);
+    print_paged(cli, &fs::read_to_string(changelog)?, false);
     Ok(())
 }
 
@@ -3945,6 +3996,26 @@ ProjectB:
         let out = next_actions(&Cli::default(), &[todo], &args).expect("next should evaluate");
         fs::remove_file(path).ok();
         assert_eq!(out.len(), 2);
+    }
+
+    #[test]
+    fn global_recurse_uses_depth_three_when_command_depth_unset() {
+        let cli = Cli {
+            recurse: true,
+            ..Default::default()
+        };
+        assert_eq!(effective_discovery_depth(&cli, None, 5), 3);
+        assert_eq!(effective_discovery_depth(&cli, Some(4), 5), 4);
+    }
+
+    #[test]
+    fn global_recurse_does_not_override_explicit_global_depth() {
+        let cli = Cli {
+            recurse: true,
+            depth: Some(2),
+            ..Default::default()
+        };
+        assert_eq!(effective_discovery_depth(&cli, None, 5), 2);
     }
 
     #[test]

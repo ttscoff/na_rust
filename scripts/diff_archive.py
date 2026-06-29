@@ -47,6 +47,7 @@ def run_archive(bin_path: Path, args: List[str], cwd: Path, fixture_name: str) -
         proc = subprocess.run(
             [str(bin_path), "archive", *args],
             cwd=str(cwd),
+            stdin=subprocess.DEVNULL,
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,

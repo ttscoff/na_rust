@@ -57,6 +57,18 @@ pub struct Cli {
     #[arg(short = 'd', long = "depth")]
     pub depth: Option<usize>,
 
+    /// Add a next action (deprecated global; use `na add`). Short `-a` is expanded in argv normalization.
+    #[arg(long = "add", default_value_t = false, global = true)]
+    pub add: bool,
+
+    /// Recurse 3 directories deep (deprecated; use `-d 3`). Short `-r` is expanded in argv normalization.
+    #[arg(long = "recurse", default_value_t = false, global = true)]
+    pub recurse: bool,
+
+    /// Display verbose debug output on stderr.
+    #[arg(long = "debug", default_value_t = false, global = true)]
+    pub debug: bool,
+
     /// Template for new/blank todo files.
     #[arg(long)]
     pub template: Option<String>,
@@ -84,6 +96,9 @@ impl Default for Cli {
             na_tag: "na".to_string(),
             add_at: "start".to_string(),
             depth: None,
+            add: false,
+            recurse: false,
+            debug: false,
             template: None,
             cwd_as: "none".to_string(),
             command: None,
@@ -1050,10 +1065,73 @@ pub fn parse_from_argv(args: impl IntoIterator<Item = impl AsRef<str>>) -> Cli {
     Cli::parse_from(normalize_argv(&args))
 }
 
+/// Note/priority globals for deprecated `na --add` / `na -a` (not stored on [`Cli`] to avoid clap conflicts).
+pub fn legacy_global_add_extras_from_argv() -> (bool, Option<String>) {
+    let args: Vec<String> = std::env::args().collect();
+    let (globals, _) = split_globals_rest(&args);
+    let note = globals
+        .iter()
+        .any(|g| g == "--note" || g == "-n");
+    let mut priority = None;
+    for (idx, g) in globals.iter().enumerate() {
+        if g == "--priority" || g == "-p" {
+            if let Some(val) = globals.get(idx + 1) {
+                if !val.starts_with('-') {
+                    priority = Some(val.clone());
+                }
+            }
+        }
+    }
+    (note, priority)
+}
+
 fn normalize_argv(args: &[String]) -> Vec<String> {
-    let mut out = rewrite_saved_positional(args);
+    let mut out = expand_legacy_global_short_flags(args);
+    out = rewrite_saved_positional(&out);
     out = rewrite_unknown_single_command(&out);
     out = rewrite_global_add_shim(&out);
+    out
+}
+
+/// Map deprecated global short flags to long forms clap can parse without subcommand conflicts.
+fn expand_legacy_global_short_flags(args: &[String]) -> Vec<String> {
+    if args.is_empty() {
+        return args.to_vec();
+    }
+    let mut out = vec![args[0].clone()];
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "-a" => {
+                out.push("--add".into());
+                i += 1;
+            }
+            "-r" => {
+                out.push("--recurse".into());
+                i += 1;
+            }
+            "-n" => {
+                out.push("--note".into());
+                i += 1;
+            }
+            "-p" => {
+                out.push("--priority".into());
+                i += 1;
+                if i < args.len() && !args[i].starts_with('-') {
+                    out.push(args[i].clone());
+                    i += 1;
+                }
+            }
+            arg if arg.starts_with('-') => {
+                out.push(args[i].clone());
+                i += 1;
+            }
+            _ => {
+                out.extend_from_slice(&args[i..]);
+                break;
+            }
+        }
+    }
     out
 }
 
@@ -1633,5 +1711,38 @@ mod tests {
     fn repo_top_flag_parses() {
         let cli = Cli::parse_from(["na", "--repo-top", "next"]);
         assert!(cli.repo_top);
+    }
+
+    #[test]
+    fn legacy_global_short_flags_expand_for_parse() {
+        let cli = parse_from_argv(["na", "-r", "--add", "next", "Ship"]);
+        assert!(cli.recurse);
+        assert!(cli.add);
+        match cli.command {
+            Some(Commands::Next(args)) => assert_eq!(args.filter.as_deref(), Some("Ship")),
+            _ => panic!("expected next"),
+        }
+    }
+
+    #[test]
+    fn legacy_recurse_short_flag_expands() {
+        let cli = parse_from_argv(["na", "-r", "find"]);
+        assert!(cli.recurse);
+    }
+
+    #[test]
+    fn next_available_short_a_parses_on_subcommand() {
+        let cli = Cli::parse_from(["na", "next", "-a"]);
+        assert!(!cli.add);
+        match cli.command {
+            Some(Commands::Next(args)) => assert!(args.first_available),
+            _ => panic!("expected next"),
+        }
+    }
+
+    #[test]
+    fn debug_flag_parses() {
+        let cli = Cli::parse_from(["na", "--debug", "find"]);
+        assert!(cli.debug);
     }
 }

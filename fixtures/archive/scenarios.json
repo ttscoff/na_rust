@@ -3,7 +3,7 @@
     {
       "name": "archive done items",
       "fixture": "base.taskpaper",
-      "args": ["--done", "--all"]
+      "args": ["--file", "case.taskpaper", "--done", "--all"]
     }
   ]
 }

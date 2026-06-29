@@ -123,9 +123,10 @@ Placeholders match Ruby’s token set: `%filename` / `%filename%`, `%line` / `%l
 - [x] Project label in action output uses leaf project (matches Ruby brackets)
 - [ ] Residual flat action edge cases (literal `{…}` in tasks now follows Ruby escape/unescape; report odd nested-brace or tag-value edge cases with a fixture if they diverge from the gem)
 - [x] Archive filtering parity in current differential fixtures
-- [ ] **Ruby globals / leftover option shims**
-  (e.g. parity for all legacy globals in `na_gem/bin/na` — `--color` vs `--no-color`-only,
-  pager/recurse/tag globals, etc. Subcommands above reflect the recent alias pass.)
+- [x] **Ruby globals / legacy shims:** `--color`, `--no-color`, `--pager` / `--no-pager`,
+  `--include_ext`, `--repo-top`, global `-d`/`--depth`, deprecated `-r`/`--recurse` (depth 3 when
+  unset), `-a`/`--add` with `-n`/`--note` and `-p`/`--priority`, and `--debug`. Remaining:
+  persisting `pager` / `include_ext` / `color` in `initconfig` / `na.rc`.
 - [x] Full `@search(...)` parity for core Ruby clause parsing (wildcards, groups, item paths, slices)
 - [ ] Mutation semantics parity beyond current `update` baseline
   (interactive editor and legacy delegation paths still partial)
