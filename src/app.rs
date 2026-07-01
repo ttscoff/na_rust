@@ -1837,18 +1837,7 @@ fn run_update(cli: &Cli, args: &UpdateArgs) -> Result<()> {
     let mut menu_priority: Option<u8> = None;
     let mut menu_plugin: Option<Plugin> = None;
 
-    let needs_action_menu = args.plugin.is_none()
-        && args.query.is_none()
-        && args.search.is_empty()
-        && add_tags.is_empty()
-        && remove_tags.is_empty()
-        && !mark_done
-        && args.replace.is_none()
-        && args.to.is_none()
-        && !args.delete
-        && !args.restore
-        && !args.edit
-        && args.note.is_empty();
+    let needs_action_menu = !update_has_mutation_flags(&args, &add_tags, &remove_tags, mark_done);
 
     let selected = if needs_action_menu {
         let menu_plugins: Vec<Plugin> = PluginRegistry::default_dir()
@@ -3118,6 +3107,24 @@ fn persist_plugin_update(
     apply_plugin_stdout_to_files(files, selected, &stdout, out_fmt, divider)
 }
 
+fn update_has_mutation_flags(
+    args: &UpdateArgs,
+    add_tags: &[String],
+    remove_tags: &[String],
+    mark_done: bool,
+) -> bool {
+    args.plugin.is_some()
+        || !add_tags.is_empty()
+        || !remove_tags.is_empty()
+        || mark_done
+        || args.replace.is_some()
+        || args.to.is_some()
+        || args.delete
+        || args.restore
+        || args.edit
+        || !args.note.is_empty()
+}
+
 fn choose_actions_interactive(actions: &[Action], interactive: bool) -> Result<Vec<Action>> {
     if actions.is_empty() {
         anyhow::bail!("No matching actions found");
@@ -3125,26 +3132,28 @@ fn choose_actions_interactive(actions: &[Action], interactive: bool) -> Result<V
     if !interactive {
         return Ok(actions.to_vec());
     }
+    if actions.len() == 1 {
+        return Ok(vec![actions[0].clone()]);
+    }
     let labels: Vec<String> = actions
         .iter()
-        .map(|a| {
-            format!(
-                "{}:{} | {}",
-                Path::new(&a.source_file)
-                    .file_name()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or(&a.source_file),
-                a.line_index + 1,
-                a.text
-            )
-        })
+        .map(action_selection_label)
         .collect();
-    let selected = MultiSelect::new(
-        "Select actions to update (Space to toggle, Enter to confirm)",
+    let selected = match MultiSelect::new(
+        "Select actions to update",
         labels.clone(),
     )
+    .with_help_message(
+        "↑↓ move, Space toggle, → select all, ← clear all, Enter confirm, type to filter",
+    )
     .prompt()
-    .map_err(map_inquire_error)?;
+    {
+        Ok(v) => v,
+        Err(InquireError::OperationCanceled | InquireError::OperationInterrupted) => {
+            anyhow::bail!("Update cancelled");
+        }
+        Err(e) => return Err(map_inquire_error(e)),
+    };
     if selected.is_empty() {
         anyhow::bail!("No actions selected");
     }
@@ -3154,6 +3163,18 @@ fn choose_actions_interactive(actions: &[Action], interactive: bool) -> Result<V
         .zip(labels.iter())
         .filter_map(|(a, label)| selected_set.contains(label).then_some(a.clone()))
         .collect())
+}
+
+fn action_selection_label(a: &Action) -> String {
+    format!(
+        "{}:{} | {}",
+        Path::new(&a.source_file)
+            .file_name()
+            .and_then(|s| s.to_str())
+            .unwrap_or(&a.source_file),
+        a.line_index + 1,
+        a.text
+    )
 }
 
 #[cfg(test)]
@@ -3617,19 +3638,19 @@ fn _single_target(cli: &Cli) -> Option<PathBuf> {
 #[cfg(test)]
 mod tests {
     use super::{
-        abbreviate_source_path, add_position_is_append, apply_global_file_add_context,
-        build_add_text, choose_from_menu, completed_matches_date, completed_matches_pattern,
-        editor_program_and_extra_args, effective_discovery_depth, find_actions,
-        find_actions_with_options, format_saved_search, implicit_next_args,
-        is_cancel_selection, is_taskpaper_search_filter, list_saved_searches,
+        abbreviate_source_path, action_selection_label, add_position_is_append,
+        apply_global_file_add_context, build_add_text, choose_from_menu,
+        completed_matches_date, completed_matches_pattern, editor_program_and_extra_args,
+        effective_discovery_depth, find_actions, find_actions_with_options, format_saved_search,
+        implicit_next_args, is_cancel_selection, is_taskpaper_search_filter, list_saved_searches,
         load_next_todo_files, load_update_todo_files, match_todo_path, next_actions,
         omnifocus_auxiliary_tags_suffix, open_command_for_target, parse_multi_action_edit_output,
         parse_multi_selection, parse_one_based_selection, parse_priority_value, parse_tag_datetime,
         parse_tag_input, parse_todo_specs, prompt_profile_path, read_scan_registry,
         restore_target_from_backup_path, run_archive, run_edit, run_move, run_plugin, run_prompt,
         run_saved, run_scan, run_tag, run_undo, run_update, save_next_search, saved_search_path,
-        saved_search_slug, shell_quote_token, strip_trailing_note, update_seed_matches,
-        write_scan_registry,
+        saved_search_slug, shell_quote_token, strip_trailing_note, update_has_mutation_flags,
+        update_seed_matches, write_scan_registry,
     };
     use crate::cli::{
         AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs, NextArgs,
@@ -4463,6 +4484,41 @@ ProjectB:
         assert!(out[0].text.contains("Timed"));
     }
 
+    #[test]
+    fn update_search_only_needs_action_menu() {
+        let args = UpdateArgs {
+            search: vec!["Style Gallery".into()],
+            ..base_update_args()
+        };
+        assert!(!update_has_mutation_flags(&args, &[], &[], false));
+    }
+
+    #[test]
+    fn update_done_flag_skips_action_menu() {
+        let args = base_update_args();
+        assert!(update_has_mutation_flags(&args, &[], &[], true));
+    }
+
+    #[test]
+    fn action_selection_label_uses_basename_and_one_based_line() {
+        let action = Action {
+            source_file: "/tmp/work/project.taskpaper".into(),
+            line_index: 4,
+            text: "Style Gallery".into(),
+            project: None,
+            project_chain: Vec::new(),
+            notes: Vec::new(),
+            tags: Vec::new(),
+            tag_values: HashMap::new(),
+            done: false,
+            due: None,
+        };
+        assert_eq!(
+            action_selection_label(&action),
+            "project.taskpaper:5 | Style Gallery"
+        );
+    }
+
     fn base_add_args(text: &str) -> AddArgs {
         AddArgs {
             text: text.to_string(),
@@ -4706,7 +4762,7 @@ Inbox:
         fs::remove_file(path).ok();
 
         assert!(
-            updated.contains("\t- Ship feature @na @patched\n- Triage bug"),
+            updated.contains("- Ship feature @na @patched\n- Triage bug"),
             "{updated}"
         );
         assert!(!updated.contains("Triage bug @patched"), "{updated}");
@@ -4782,8 +4838,8 @@ Inbox:
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
 
-        assert!(updated.contains("\t- First @bulk"), "{updated}");
-        assert!(updated.contains("\t- Second @bulk"), "{updated}");
+        assert!(updated.contains("- First @bulk"), "{updated}");
+        assert!(updated.contains("- Second @bulk"), "{updated}");
     }
 
     #[test]
@@ -4809,7 +4865,7 @@ Inbox:
         let updated = fs::read_to_string(&path).expect("fixture should read");
         fs::remove_file(path).ok();
         assert!(updated.contains("- New title @na"), "{updated}");
-        assert!(updated.contains("\tfresh note"), "{updated}");
+        assert!(updated.contains("    fresh note"), "{updated}");
         assert!(!updated.contains("old note"), "{updated}");
     }
 

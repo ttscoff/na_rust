@@ -3,8 +3,64 @@ use regex::Regex;
 use std::collections::HashMap;
 use std::path::Path;
 
-fn indentation_width(line: &str) -> usize {
-    line.chars().take_while(|ch| ch.is_whitespace()).count()
+/// TaskPaper project header: `Name:` with optional `@tags` after the colon (Ruby `String#project?`).
+pub fn parse_project_header(trimmed: &str) -> Option<String> {
+    if trimmed.starts_with("- ") {
+        return None;
+    }
+    let (name_part, after_colon) = trimmed.split_once(':')?;
+    let name = name_part.trim();
+    if name.is_empty() {
+        return None;
+    }
+    let suffix = after_colon.trim();
+    if !suffix.is_empty()
+        && !suffix
+            .split_whitespace()
+            .all(|token| token.starts_with('@'))
+    {
+        return None;
+    }
+    Some(name.to_string())
+}
+
+/// TaskPaper indent level: leading tabs, with runs of 4 spaces treated as one tab (Ruby `indent_level`).
+pub fn taskpaper_indent_level(line: &str) -> usize {
+    let prefix: String = line.chars().take_while(|ch| ch.is_whitespace()).collect();
+    if prefix.is_empty() {
+        return 0;
+    }
+    prefix
+        .replace("    ", "\t")
+        .chars()
+        .filter(|&c| c == '\t')
+        .count()
+}
+
+/// Parent chain for an action at `action_indent` (Ruby `NA::Todo` effective_parent).
+fn effective_project_chain(
+    project_stack: &[(usize, String)],
+    action_indent: usize,
+) -> Vec<String> {
+    if project_stack.is_empty() {
+        return Vec::new();
+    }
+    if let Some(chosen_index) = project_stack
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(i, (proj_indent, _))| (*proj_indent < action_indent).then_some(i))
+    {
+        project_stack[..=chosen_index]
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect()
+    } else {
+        project_stack
+            .iter()
+            .map(|(_, name)| name.clone())
+            .collect()
+    }
 }
 
 pub fn extract_actions(lines: &[String], path: &Path) -> Vec<Action> {
@@ -16,10 +72,9 @@ pub fn extract_actions(lines: &[String], path: &Path) -> Vec<Action> {
     while idx < lines.len() {
         let line = lines[idx].trim_end();
         let trimmed = line.trim();
-        let indent = indentation_width(line);
+        let indent = taskpaper_indent_level(line);
 
-        if trimmed.ends_with(':') && !trimmed.starts_with("- ") {
-            let project_name = trimmed.trim_end_matches(':').trim().to_string();
+        if let Some(project_name) = parse_project_header(trimmed) {
             while project_stack
                 .last()
                 .is_some_and(|(project_indent, _)| *project_indent >= indent)
@@ -47,14 +102,13 @@ pub fn extract_actions(lines: &[String], path: &Path) -> Vec<Action> {
             }
         }
         let done = tags.iter().any(|t| t == "@done");
-        let project_chain: Vec<String> =
-            project_stack.iter().map(|(_, name)| name.clone()).collect();
+        let project_chain = effective_project_chain(&project_stack, indent);
         let mut notes = Vec::new();
         let mut note_idx = idx + 1;
         while note_idx < lines.len() {
             let candidate_line = lines[note_idx].trim_end();
             let candidate_trimmed = candidate_line.trim();
-            let candidate_indent = indentation_width(candidate_line);
+            let candidate_indent = taskpaper_indent_level(candidate_line);
 
             if candidate_trimmed.is_empty() {
                 notes.push(String::new());
@@ -62,7 +116,7 @@ pub fn extract_actions(lines: &[String], path: &Path) -> Vec<Action> {
                 continue;
             }
 
-            if candidate_trimmed.ends_with(':') && !candidate_trimmed.starts_with("- ") {
+            if parse_project_header(candidate_trimmed).is_some() {
                 break;
             }
             if candidate_trimmed.starts_with("- ") {
@@ -131,8 +185,8 @@ mod tests {
     fn parses_project_and_action_lines() {
         let lines = vec![
             "House:".to_string(),
-            "  - Take out trash @home".to_string(),
-            "  - Mow lawn @weekend".to_string(),
+            "\t- Take out trash @home".to_string(),
+            "\t- Mow lawn @weekend".to_string(),
         ];
 
         let actions = extract_actions(&lines, Path::new("sample.taskpaper"));
@@ -155,10 +209,10 @@ mod tests {
     fn parses_nested_projects_with_parent_chain() {
         let lines = vec![
             "Work:".to_string(),
-            "  ClientA:".to_string(),
-            "    - Draft proposal @na".to_string(),
-            "  ClientB:".to_string(),
-            "    - Send update @na".to_string(),
+            "\tClientA:".to_string(),
+            "\t\t- Draft proposal @na".to_string(),
+            "\tClientB:".to_string(),
+            "\t\t- Send update @na".to_string(),
         ];
         let actions = extract_actions(&lines, Path::new("nested.taskpaper"));
         assert_eq!(actions.len(), 2);
@@ -178,10 +232,10 @@ mod tests {
     fn parses_action_note_blocks() {
         let lines = vec![
             "Work:".to_string(),
-            "  - Draft proposal @na".to_string(),
-            "    outline opening section".to_string(),
-            "    include timeline".to_string(),
-            "  - Ship draft @na".to_string(),
+            "\t- Draft proposal @na".to_string(),
+            "\t\toutline opening section".to_string(),
+            "\t\tinclude timeline".to_string(),
+            "\t- Ship draft @na".to_string(),
         ];
         let actions = extract_actions(&lines, Path::new("notes.taskpaper"));
         assert_eq!(actions.len(), 2);
@@ -193,6 +247,47 @@ mod tests {
             ]
         );
         assert!(actions[1].notes.is_empty());
+    }
+
+    #[test]
+    fn parses_project_lines_with_trailing_tags() {
+        let lines = vec![
+            "Inbox: @bucket @.todo".to_string(),
+            "\tNew Videos:".to_string(),
+            "\t\t- under subproject".to_string(),
+            "\t- back in inbox".to_string(),
+        ];
+        let actions = extract_actions(&lines, Path::new("tagged-project.taskpaper"));
+        assert_eq!(actions.len(), 2);
+        assert_eq!(actions[0].project_chain, vec!["Inbox", "New Videos"]);
+        assert_eq!(actions[1].project_chain, vec!["Inbox"]);
+    }
+
+    #[test]
+    fn actions_after_subproject_outdent_use_parent_only() {
+        let lines = vec![
+            "Inbox:".to_string(),
+            "\t- before subproject @na".to_string(),
+            "\tNew Videos:".to_string(),
+            "\t\t- under New Videos @na".to_string(),
+            "\t\t- also under New Videos".to_string(),
+            "\t- after subproject @na".to_string(),
+            "\t- still inbox @na".to_string(),
+        ];
+        let actions = extract_actions(&lines, Path::new("inbox.taskpaper"));
+        assert_eq!(actions.len(), 5);
+        assert_eq!(actions[0].project_chain, vec!["Inbox"]);
+        assert_eq!(actions[1].project_chain, vec!["Inbox", "New Videos"]);
+        assert_eq!(actions[2].project_chain, vec!["Inbox", "New Videos"]);
+        assert_eq!(actions[3].project_chain, vec!["Inbox"]);
+        assert_eq!(actions[4].project_chain, vec!["Inbox"]);
+    }
+
+    #[test]
+    fn indentation_level_counts_tabs_and_space_groups() {
+        assert_eq!(super::taskpaper_indent_level("\t- action"), 1);
+        assert_eq!(super::taskpaper_indent_level("    - action"), 1);
+        assert_eq!(super::taskpaper_indent_level("\t\t- action"), 2);
     }
 
     #[test]
@@ -217,14 +312,14 @@ mod tests {
     fn render_lines_round_trips_note_blocks() {
         let lines = vec![
             "Work:".to_string(),
-            "  - Draft proposal @na".to_string(),
-            "    outline opening section".to_string(),
-            "    include timeline".to_string(),
+            "\t- Draft proposal @na".to_string(),
+            "\t\toutline opening section".to_string(),
+            "\t\tinclude timeline".to_string(),
         ];
         let rendered = render_lines(&lines);
         assert_eq!(
             rendered,
-            "Work:\n  - Draft proposal @na\n    outline opening section\n    include timeline\n"
+            "Work:\n\t- Draft proposal @na\n\t\toutline opening section\n\t\tinclude timeline\n"
         );
     }
 }

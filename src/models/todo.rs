@@ -3,7 +3,7 @@ use crate::models::action::Action;
 #[cfg(test)]
 use crate::parser::search::Query;
 use crate::parser::expand_date_tags_in_line;
-use crate::parser::taskpaper::{extract_actions, render_lines};
+use crate::parser::taskpaper::{extract_actions, parse_project_header, render_lines, taskpaper_indent_level};
 use anyhow::{Context, Result};
 use chrono::Local;
 use regex::Regex;
@@ -99,18 +99,20 @@ impl TodoFile {
             .filter(|s| !s.is_empty())
             .unwrap_or("Inbox");
         let header = format!("{project_name}:");
-        let proj_idx = self
-            .lines
-            .iter()
-            .position(|line| line.trim() == header)
-            .unwrap_or_else(|| {
-                if !self.lines.is_empty() && !self.lines.last().is_some_and(|l| l.trim().is_empty())
-                {
-                    self.lines.push(String::new());
-                }
-                self.lines.push(header.clone());
-                self.lines.len() - 1
-            });
+        let proj_idx = find_project_line(&self.lines, project_name).unwrap_or_else(|| {
+            self.lines
+                .iter()
+                .position(|line| line.trim() == header)
+                .unwrap_or_else(|| {
+                    if !self.lines.is_empty()
+                        && !self.lines.last().is_some_and(|l| l.trim().is_empty())
+                    {
+                        self.lines.push(String::new());
+                    }
+                    self.lines.push(header.clone());
+                    self.lines.len() - 1
+                })
+        });
 
         let insert_idx = if append {
             project_block_end(&self.lines, proj_idx)
@@ -118,14 +120,27 @@ impl TodoFile {
             proj_idx + 1
         };
 
-        let action_line = if tab_indent {
-            format!("\t- {text}")
+        let (action_line, note_lines) = if tab_indent {
+            let action_leading = action_leading_under_project(&self.lines[proj_idx]);
+            let note_leading = note_leading_under_action(&action_leading);
+            (
+                format_task_line(&action_leading, text),
+                notes
+                    .iter()
+                    .map(|n| format_note_line(&note_leading, n.trim()))
+                    .collect::<Vec<_>>(),
+            )
         } else {
-            format!("- {text}")
+            let action_line = format!("- {text}");
+            let note_lines = notes
+                .iter()
+                .map(|n| format!("\t{n}"))
+                .collect::<Vec<_>>();
+            (action_line, note_lines)
         };
         self.lines.insert(insert_idx, action_line);
-        for (i, note) in notes.iter().enumerate() {
-            self.lines.insert(insert_idx + 1 + i, format!("\t{note}"));
+        for (i, note) in note_lines.iter().enumerate() {
+            self.lines.insert(insert_idx + 1 + i, note.clone());
         }
     }
 
@@ -206,6 +221,14 @@ impl TodoFile {
             if start >= self.lines.len() {
                 continue;
             }
+
+            let raw_action_line = self.lines[start].clone();
+            let action_leading = task_line_leading(&raw_action_line);
+            let raw_note_lines: Vec<String> = (start + 1..end)
+                .filter(|i| *i < self.lines.len())
+                .map(|i| self.lines[i].clone())
+                .collect();
+
             if mutation.delete {
                 self.lines.drain(start..end);
                 changed += 1;
@@ -262,10 +285,11 @@ impl TodoFile {
                     true,
                 );
             } else {
-                // Reinsert at the original line index (bottom-up order keeps indices stable).
-                self.lines.insert(start, format!("\t- {text}"));
-                for (i, note) in notes.iter().enumerate() {
-                    self.lines.insert(start + 1 + i, format!("\t{note}"));
+                self.lines
+                    .insert(start, format_task_line(&action_leading, &text));
+                let note_lines = build_note_lines(&raw_note_lines, &notes, &action_leading);
+                for (i, note_line) in note_lines.iter().enumerate() {
+                    self.lines.insert(start + 1 + i, note_line.clone());
                 }
             }
             changed += 1;
@@ -377,6 +401,112 @@ impl TodoFile {
     }
 }
 
+fn normalize_project_path(project: &str) -> Vec<String> {
+    project
+        .split([':', '/'])
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect()
+}
+
+/// Find a project header line by colon/slash path (e.g. `Inbox:New Videos`).
+fn find_project_line(lines: &[String], project_path: &str) -> Option<usize> {
+    let target = normalize_project_path(project_path);
+    if target.is_empty() {
+        return None;
+    }
+    let mut stack: Vec<(usize, String)> = Vec::new();
+    let mut last_leaf_match: Option<usize> = None;
+    for (idx, line) in lines.iter().enumerate() {
+        let trimmed = line.trim();
+        let Some(name) = parse_project_header(trimmed) else {
+            continue;
+        };
+        let indent = taskpaper_indent_level(line);
+        while stack
+            .last()
+            .is_some_and(|(project_indent, _)| *project_indent >= indent)
+        {
+            stack.pop();
+        }
+        stack.push((indent, name));
+        let chain: Vec<String> = stack.iter().map(|(_, n)| n.clone()).collect();
+        if chain.len() >= target.len() {
+            let tail = &chain[chain.len() - target.len()..];
+            if tail
+                .iter()
+                .zip(target.iter())
+                .all(|(a, b)| a.eq_ignore_ascii_case(b))
+            {
+                return Some(idx);
+            }
+        }
+        if target.len() == 1 {
+            if chain
+                .last()
+                .is_some_and(|leaf| leaf.eq_ignore_ascii_case(&target[0]))
+            {
+                last_leaf_match = Some(idx);
+            }
+        }
+    }
+    if target.len() == 1 {
+        last_leaf_match
+    } else {
+        None
+    }
+}
+
+fn task_line_leading(raw: &str) -> String {
+    let ws_len = raw.len().saturating_sub(raw.trim_start().len());
+    raw[..ws_len].to_string()
+}
+
+fn format_task_line(leading: &str, text: &str) -> String {
+    format!("{leading}- {text}")
+}
+
+fn format_note_line(leading: &str, text: &str) -> String {
+    format!("{leading}{text}")
+}
+
+fn note_leading_from_raw(raw: &str) -> String {
+    task_line_leading(raw)
+}
+
+fn action_leading_under_project(project_line: &str) -> String {
+    format!("{}\t", task_line_leading(project_line))
+}
+
+fn note_leading_under_action(action_leading: &str) -> String {
+    format!("{action_leading}\t")
+}
+
+fn default_note_leading_for_action(action_leading: &str) -> String {
+    note_leading_under_action(action_leading)
+}
+
+fn build_note_lines(
+    raw_existing: &[String],
+    final_contents: &[String],
+    action_leading: &str,
+) -> Vec<String> {
+    let note_leading = raw_existing
+        .first()
+        .map(|line| note_leading_from_raw(line.as_str()))
+        .unwrap_or_else(|| default_note_leading_for_action(action_leading));
+    let contents: Vec<String> = final_contents
+        .iter()
+        .map(|n| n.trim().to_string())
+        .filter(|n| !n.is_empty())
+        .collect();
+    contents
+        .into_iter()
+        .map(|n| format_note_line(&note_leading, &n))
+        .collect()
+}
+
 fn remove_tag_from_line(line: &mut String, tag: &str) {
     let normalized = tag.trim();
     if normalized.is_empty() {
@@ -406,14 +536,14 @@ fn apply_done_timestamp_to_text(text: &str) -> String {
 }
 
 fn project_block_end(lines: &[String], project_idx: usize) -> usize {
-    let project_indent = leading_whitespace(lines[project_idx].as_str());
+    let project_indent = taskpaper_indent_level(lines[project_idx].as_str());
     let mut idx = project_idx + 1;
     while idx < lines.len() {
         let line = lines[idx].as_str();
         let trimmed = line.trim();
         if !trimmed.is_empty()
-            && trimmed.ends_with(':')
-            && leading_whitespace(line) <= project_indent
+            && parse_project_header(trimmed).is_some()
+            && taskpaper_indent_level(line) <= project_indent
         {
             break;
         }
@@ -422,13 +552,9 @@ fn project_block_end(lines: &[String], project_idx: usize) -> usize {
     idx
 }
 
-fn leading_whitespace(line: &str) -> usize {
-    line.chars().take_while(|c| c.is_ascii_whitespace()).count()
-}
-
 #[cfg(test)]
 mod tests {
-    use super::TodoFile;
+    use super::{TodoFile, UpdateMutation};
     use crate::models::action::Action;
     use crate::io::fs::backup_path;
     use crate::parser::search::Query;
@@ -611,5 +737,64 @@ mod tests {
             "{updated}"
         );
         assert!(!updated.contains("Work:\n- Ship thing"), "{updated}");
+    }
+
+    #[test]
+    fn apply_mutation_preserves_nested_action_indent() {
+        let path = write_fixture_taskpaper(
+            "Inbox:\n\t- before @na\n\tNew Videos:\n\t\t- nested @na\n\t\t\tnote line\n\t- after @na\n",
+        );
+        let mut todo = TodoFile::load(&path).expect("fixture should load");
+        let actions = todo.actions();
+        let nested = actions.iter().find(|a| a.text.contains("nested")).expect("nested");
+        let after = actions.iter().find(|a| a.text.contains("after")).expect("after");
+        let backup = backup_path(&path);
+        let mutation = UpdateMutation {
+            done: true,
+            note_lines: vec!["appended note".to_string()],
+            ..UpdateMutation::default()
+        };
+        let changed = todo
+            .apply_mutation_by_lines(
+                &HashSet::from([nested.line_index, after.line_index]),
+                &mutation,
+            )
+            .expect("update");
+        let updated = fs::read_to_string(&path).expect("read");
+        fs::remove_file(path).ok();
+        fs::remove_file(backup).ok();
+        assert_eq!(changed, 2);
+        assert!(updated.contains("\t\t- nested @na @done("), "{updated}");
+        assert!(updated.contains("\t\t\tnote line"), "{updated}");
+        assert!(updated.contains("\t\t\tappended note"), "{updated}");
+        assert!(updated.contains("\t- after @na @done("), "{updated}");
+    }
+
+    #[test]
+    fn move_action_uses_indent_under_target_project() {
+        let path = write_fixture_taskpaper(
+            "Inbox:\n\tNew Videos:\n\t\t- move me @na\n\t- stay @na\n",
+        );
+        let mut todo = TodoFile::load(&path).expect("fixture should load");
+        let action = todo
+            .actions()
+            .into_iter()
+            .find(|a| a.text.contains("move me"))
+            .expect("action");
+        let backup = backup_path(&path);
+        let mutation = UpdateMutation {
+            move_to_project: Some("Inbox".to_string()),
+            append_to_project_end: true,
+            ..UpdateMutation::default()
+        };
+        todo.apply_mutation_by_lines(&HashSet::from([action.line_index]), &mutation)
+            .expect("move");
+        let updated = fs::read_to_string(&path).expect("read");
+        fs::remove_file(path).ok();
+        fs::remove_file(backup).ok();
+        assert!(updated.contains("\t- move me @na"), "{updated}");
+        assert!(!updated.contains("\t\t- move me @na"), "{updated}");
+        assert!(updated.contains("\t- stay @na"), "{updated}");
+        assert!(!updated.contains("\t\t- stay @na"), "{updated}");
     }
 }
