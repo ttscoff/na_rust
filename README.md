@@ -12,6 +12,15 @@ Because todo files are plain text, they work with git, diff, sync, and any edito
 
 ## Installation
 
+**Homebrew (recommended on macOS):**
+
+```bash
+brew tap ttscoff/thelab
+brew install ttscoff/thelab/na
+```
+
+**Cargo:**
+
 ```bash
 cargo install na_rust
 ```
@@ -430,8 +439,10 @@ na prompt [SUBCOMMAND]
 
 | Subcommand | Description |
 |------------|-------------|
-| `show` | Print the prompt hook script |
+| `show` | Print the prompt hook script for your current shell |
 | `install` | Install the hook into your shell profile |
+
+See [Prompt hooks](#prompt-hooks) below for setup details.
 
 ### `changes`, `changelog`
 
@@ -492,6 +503,35 @@ na plugin SUBCOMMAND [OPTIONS]
 `plugin run` flags: `--file`, `-d`/`--depth`, `--in`/`--todo`, `--search`/`--find`/`--grep`, `--done`, `--tagged`, `--input`, `--output`, `--divider`.
 
 Plugins live in `$XDG_DATA_HOME/na/plugins` (or `~/.local/share/na/plugins`).
+
+## Prompt hooks
+
+You can add a prompt command to your shell to have **na** automatically list your next actions when you `cd` into a directory. To install a prompt command for your current shell, run:
+
+```bash
+na prompt install
+```
+
+It works with Zsh, Bash, and Fish. If you'd rather edit your startup file yourself, run `na prompt show` to print the hook and where to add it.
+
+If you're using a single global file (`--global-file`), a prompt hook requires `--cwd_as` to be `tag` or `project`. **na** will list actions based on the current directory name — matching either a project or a tag, depending on your setting.
+
+Add `-r` to recurse three directories deep on each `cd`, or set a default depth in `na.rc`.
+
+After installing a hook, start a new terminal session (or `source` your profile) to activate it.
+
+**Zsh example** (what `na prompt show` generates):
+
+```bash
+# zsh prompt hook for na
+chpwd() { na next }
+```
+
+With a global file and project-based filtering:
+
+```bash
+na --global-file ~/todo.taskpaper --cwd_as project prompt install
+```
 
 ## Configuration
 
