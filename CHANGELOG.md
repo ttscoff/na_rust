@@ -1,3 +1,21 @@
+### 1.0.1
+
+2026-07-03 06:38
+
+#### CHANGED
+
+- Version 0.2.0
+
+#### IMPROVED
+
+- Interactive update multi-select starts with nothing selected; help line documents Space toggle, arrow keys for select all/clear all, Enter to confirm, and type-to-filter
+
+#### FIXED
+
+- Parse project headers with trailing tags (e.g. `Inbox: @bucket`) and assign actions to the correct parent after outdent (sibling tasks no longer stay under closed subprojects like New Videos)
+- Preserve exact action and note indentation when updating tasks (finish, tags, notes, replace); only adjust indent when moving to another project (one tab deeper than the target project header)
+- Interactive `update --search` now shows the operation menu after selecting tasks instead of applying a no-op update
+
 ### 0.1.0
 
 2026-06-29 08:34
