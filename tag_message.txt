@@ -1,10 +1,17 @@
-v1.0.3
+v1.0.4
 
-### 1.0.3
+### 1.0.4
 
-2026-07-22 04:43
+2026-07-22 05:12
+
+#### CHANGED
+
+- Version 1.0.3
 
 #### FIXED
 
 - Action versions updated to remove Node 20 warnings
+- `na edit` opens matched actions in $EDITOR with path:line separators and writes changes back (use optional `--text` for non-interactive replace)
+- `na todos` lists known todo files from the tdlist registry from anywhere, with optional path-token queries and `--edit` opening the registry file
+- Discovered todo files are registered automatically so `--in` / `--all` can resolve known todos outside the current directory
 
