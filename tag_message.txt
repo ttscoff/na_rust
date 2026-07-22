@@ -1,0 +1,10 @@
+v1.0.3
+
+### 1.0.3
+
+2026-07-22 04:43
+
+#### FIXED
+
+- Action versions updated to remove Node 20 warnings
+
