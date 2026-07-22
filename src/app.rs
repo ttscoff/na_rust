@@ -4,7 +4,7 @@ use crate::cli::{
     OpenArgs, PluginCommands, ProjectsArgs, PromptArgs, PromptCommands, SavedCommands, ScanArgs,
     TagArgs, TaggedArgs, TodosArgs, UndoArgs, UpdateArgs, legacy_global_add_extras_from_argv,
 };
-use crate::io::fs::{discover_taskpaper_files, discover_taskpaper_files_with_options};
+use crate::io::fs::discover_taskpaper_files_with_options;
 use crate::io::config::{find_na_rc_path, rc_globals_from_cli, write_na_rc};
 use crate::io::xdg::{na_backup_dir, na_data_dir};
 use crate::models::action::Action;
@@ -719,30 +719,15 @@ fn run_next_plugin_merge(args: &NextArgs, actions: &[Action]) -> Result<Option<V
 }
 
 fn load_next_todo_files(cli: &Cli, args: &NextArgs) -> Result<Vec<TodoFile>> {
-    if let Some(path) = &args.file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
-
     let depth = effective_discovery_depth(cli, args.depth, 5);
-    let mut files = if let Some(path) = &cli.global_file {
-        vec![path.clone()]
-    } else {
-        discover_taskpaper_files_with_options(&cli.extension, depth, args.hidden)?
-    };
-
-    if !args.in_todo.is_empty() {
-        let needles: Vec<String> = args
-            .in_todo
-            .iter()
-            .map(|s| s.to_ascii_lowercase())
-            .collect();
-        files.retain(|path| {
-            let candidate = path.to_string_lossy().to_ascii_lowercase();
-            needles.iter().any(|needle| candidate.contains(needle))
-        });
-    }
+    let files = resolve_scoped_todo_paths(
+        cli,
+        args.file.as_ref(),
+        &args.in_todo,
+        args.all,
+        depth,
+        args.hidden,
+    )?;
 
     files
         .iter()
@@ -1131,15 +1116,7 @@ fn run_find_plugin_merge(args: &FindArgs, actions: &[Action]) -> Result<Option<V
 
 fn load_find_todo_files(cli: &Cli, args: &FindArgs) -> Result<Vec<TodoFile>> {
     let depth = effective_discovery_depth(cli, args.depth, 5);
-    let mut files = if let Some(path) = &cli.global_file {
-        vec![path.clone()]
-    } else {
-        discover_taskpaper_files_with_options(&cli.extension, depth, false)?
-    };
-    if !args.in_todo.is_empty() {
-        let specs = parse_todo_specs(&args.in_todo);
-        files.retain(|path| match_todo_path(path.to_string_lossy().as_ref(), &specs));
-    }
+    let files = resolve_scoped_todo_paths(cli, None, &args.in_todo, false, depth, false)?;
     files
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
@@ -1302,15 +1279,7 @@ fn run_completed(cli: &Cli, args: &CompletedArgs) -> Result<()> {
 
 fn load_completed_todo_files(cli: &Cli, args: &CompletedArgs) -> Result<Vec<TodoFile>> {
     let depth = effective_discovery_depth(cli, args.depth, 5);
-    let mut files = if let Some(path) = &cli.global_file {
-        vec![path.clone()]
-    } else {
-        discover_taskpaper_files_with_options(&cli.extension, depth, false)?
-    };
-    if !args.in_todo.is_empty() {
-        let specs = parse_todo_specs(&args.in_todo);
-        files.retain(|path| match_todo_path(path.to_string_lossy().as_ref(), &specs));
-    }
+    let files = resolve_scoped_todo_paths(cli, None, &args.in_todo, false, depth, false)?;
     files
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
@@ -1533,22 +1502,15 @@ fn choose_add_file_index(files: &[TodoFile], interactive: bool) -> Result<usize>
 }
 
 fn load_add_todo_files(cli: &Cli, args: &AddArgs) -> Result<Vec<TodoFile>> {
-    if let Some(path) = &args.file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
-    if let Some(path) = &cli.global_file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
     let depth = effective_discovery_depth(cli, args.depth, 1);
-    let mut files = discover_taskpaper_files_with_options(&cli.extension, depth, false)?;
-    if !args.in_todo.is_empty() {
-        let specs = parse_todo_specs(&args.in_todo);
-        files.retain(|path| match_todo_path(path.to_string_lossy().as_ref(), &specs));
-    }
+    let files = resolve_scoped_todo_paths(
+        cli,
+        args.file.as_ref(),
+        &args.in_todo,
+        false,
+        depth,
+        false,
+    )?;
     files
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
@@ -2273,29 +2235,37 @@ fn run_multi_action_editor(
 }
 
 fn run_edit(cli: &Cli, args: &EditArgs) -> Result<()> {
+    let has_query = args.query.is_some()
+        || !args.search.is_empty()
+        || !args.tagged.is_empty();
+    let use_editor = args.text.is_none();
+    if use_editor && !has_query {
+        anyhow::bail!("No search terms provided");
+    }
+
     let mut update_args = UpdateArgs {
         query: args.query.clone(),
         tag: Vec::new(),
         untag: Vec::new(),
-        done: false,
+        done: args.done,
         file: args.file.clone(),
         depth: args.depth,
         in_todo: args.in_todo.clone(),
         search: args.search.clone(),
         all: args.all,
-        replace: Some(args.text.clone()),
+        replace: args.text.clone(),
         to: None,
         project: None,
-        tagged: Vec::new(),
-        regex: false,
-        exact: false,
-        search_notes: true,
-        no_search_notes: false,
+        tagged: args.tagged.clone(),
+        regex: args.regex,
+        exact: args.exact,
+        search_notes: args.search_notes,
+        no_search_notes: args.no_search_notes,
         priority: None,
         at: None,
         archive: false,
-        edit: false,
-        editor: None,
+        edit: use_editor,
+        editor: args.editor.clone(),
         delete: false,
         restore: false,
         note: Vec::new(),
@@ -2308,7 +2278,8 @@ fn run_edit(cli: &Cli, args: &EditArgs) -> Result<()> {
         output: None,
         divider: None,
     };
-    if update_args.query.is_none() && update_args.search.is_empty() {
+    // Non-interactive `--text` with no selector: apply to all matches in scope.
+    if !use_editor && !has_query {
         update_args.all = true;
     }
     run_update(cli, &update_args)
@@ -2423,19 +2394,14 @@ fn run_tag(cli: &Cli, args: &TagArgs) -> Result<()> {
 }
 
 fn run_open(cli: &Cli, args: &OpenArgs) -> Result<()> {
-    let mut paths = if let Some(path) = &cli.global_file {
-        vec![path.clone()]
-    } else {
-        discover_taskpaper_files_with_options(
-            &cli.extension,
-            effective_discovery_depth_usize(cli, args.depth, 1),
-            false,
-        )?
-    };
-    if !args.in_todo.is_empty() {
-        let specs = parse_todo_specs(&args.in_todo);
-        paths.retain(|p| match_todo_path(p.to_string_lossy().as_ref(), &specs));
-    }
+    let paths = resolve_scoped_todo_paths(
+        cli,
+        None,
+        &args.in_todo,
+        false,
+        effective_discovery_depth_usize(cli, args.depth, 1),
+        false,
+    )?;
     let Some(path) = paths.first() else {
         anyhow::bail!("No todo file found");
     };
@@ -2483,7 +2449,7 @@ fn run_projects(cli: &Cli, args: &ProjectsArgs) -> Result<()> {
     let files = if let Some(path) = &cli.global_file {
         vec![TodoFile::load(path)?]
     } else {
-        discover_taskpaper_files_with_options(
+        discover_and_register(
             &cli.extension,
             effective_discovery_depth_usize(cli, args.depth, 1),
             false,
@@ -2505,20 +2471,29 @@ fn run_projects(cli: &Cli, args: &ProjectsArgs) -> Result<()> {
 }
 
 fn run_todos(cli: &Cli, args: &TodosArgs) -> Result<()> {
+    if args.edit {
+        let path = ensure_scan_registry_file()?;
+        let editor = resolve_update_editor(None)?;
+        run_editor_wait(&path, &editor)?;
+        println!("Opened {} in editor", path.display());
+        return Ok(());
+    }
+
     let paths = if let Some(path) = &cli.global_file {
-        vec![path.clone()]
+        vec![absolutize_todo_path(path)]
+    } else if args.query.is_empty() {
+        known_todo_paths()?
     } else {
-        discover_taskpaper_files(&cli.extension)?
+        match_known_todos(&args.query)?
     };
+
+    if paths.is_empty() {
+        anyhow::bail!(
+            "No known todo files. Discover some with `na` / `na scan`, or add paths via `na todos --edit`."
+        );
+    }
     for p in &paths {
         println!("{}", p.display());
-    }
-    if args.edit {
-        let Some(first) = paths.first() else {
-            return Ok(());
-        };
-        let editor = std::env::var("EDITOR").unwrap_or_else(|_| "vi".to_string());
-        let _ = std::process::Command::new(editor).arg(first).status()?;
     }
     Ok(())
 }
@@ -2602,19 +2577,24 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<()> {
         &cli.extension,
         effective_discovery_depth_usize(cli, args.depth, 1),
         args.hidden,
-    )?
-        .into_iter()
+    )?;
+    let abs_files: Vec<PathBuf> = files.iter().map(|p| absolutize_todo_path(p)).collect();
+    let discovered: HashSet<String> = abs_files
+        .iter()
         .map(|p| p.to_string_lossy().to_string())
-        .collect::<Vec<_>>();
-    let discovered: HashSet<String> = files.iter().cloned().collect();
+        .collect();
     let existing = read_scan_registry()?;
     let mut to_add: Vec<String> = discovered.difference(&existing).cloned().collect();
-    let mut to_remove: Vec<String> = existing.difference(&discovered).cloned().collect();
+    let mut to_remove: Vec<String> = if args.prune {
+        existing.difference(&discovered).cloned().collect()
+    } else {
+        Vec::new()
+    };
     to_add.sort();
     to_remove.sort();
 
-    for f in &files {
-        println!("{f}");
+    for f in &abs_files {
+        println!("{}", f.display());
     }
     if args.prune || args.dry_run {
         for p in &to_add {
@@ -2637,11 +2617,32 @@ fn run_scan(cli: &Cli, args: &ScanArgs) -> Result<()> {
 }
 
 fn scan_registry_path() -> PathBuf {
+    na_data_dir().join("tdlist.txt")
+}
+
+fn ruby_compat_tdlist_path() -> Option<PathBuf> {
+    let home = std::env::var_os("HOME")?;
+    Some(PathBuf::from(home).join(".local").join("share").join("na").join("tdlist.txt"))
+}
+
+fn legacy_scan_registry_path() -> PathBuf {
     na_data_dir().join("scan_paths.txt")
 }
 
-fn read_scan_registry() -> Result<HashSet<String>> {
+fn ensure_scan_registry_file() -> Result<PathBuf> {
     let path = scan_registry_path();
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent)?;
+    }
+    if !path.exists() {
+        // Seed from Ruby / legacy registries when present.
+        let seed = read_scan_registry()?;
+        write_scan_registry(&seed)?;
+    }
+    Ok(path)
+}
+
+fn read_registry_file(path: &Path) -> Result<HashSet<String>> {
     if !path.exists() {
         return Ok(HashSet::new());
     }
@@ -2654,6 +2655,26 @@ fn read_scan_registry() -> Result<HashSet<String>> {
         .collect())
 }
 
+fn read_scan_registry() -> Result<HashSet<String>> {
+    let mut paths = read_registry_file(&scan_registry_path())?;
+    // Migrate prior Rust filename if present.
+    for p in read_registry_file(&legacy_scan_registry_path())? {
+        paths.insert(p);
+    }
+    // Merge Ruby gem database (`~/.local/share/na/tdlist.txt`) when XDG is not
+    // overridden and the path is distinct from the primary registry.
+    if std::env::var_os("XDG_DATA_HOME").is_none() {
+        if let Some(ruby_path) = ruby_compat_tdlist_path() {
+            if ruby_path != scan_registry_path() {
+                for p in read_registry_file(&ruby_path)? {
+                    paths.insert(p);
+                }
+            }
+        }
+    }
+    Ok(paths)
+}
+
 fn write_scan_registry(paths: &HashSet<String>) -> Result<()> {
     let path = scan_registry_path();
     if let Some(parent) = path.parent() {
@@ -2661,8 +2682,110 @@ fn write_scan_registry(paths: &HashSet<String>) -> Result<()> {
     }
     let mut sorted: Vec<String> = paths.iter().cloned().collect();
     sorted.sort();
-    fs::write(path, sorted.join("\n") + "\n")?;
+    let body = if sorted.is_empty() {
+        String::new()
+    } else {
+        sorted.join("\n") + "\n"
+    };
+    fs::write(path, body)?;
     Ok(())
+}
+
+fn absolutize_todo_path(path: &Path) -> PathBuf {
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    match std::env::current_dir() {
+        Ok(cwd) => cwd.join(path),
+        Err(_) => path.to_path_buf(),
+    }
+}
+
+/// Persist discovered todo paths into the known-todo registry (Ruby `save_working_dir`).
+fn register_todo_paths(paths: &[PathBuf]) -> Result<()> {
+    if paths.is_empty() {
+        return Ok(());
+    }
+    let mut existing = read_scan_registry()?;
+    let mut changed = false;
+    for path in paths {
+        let abs = absolutize_todo_path(path);
+        let key = abs.to_string_lossy().to_string();
+        if existing.insert(key) {
+            changed = true;
+        }
+    }
+    if changed {
+        write_scan_registry(&existing)?;
+    }
+    Ok(())
+}
+
+fn known_todo_paths() -> Result<Vec<PathBuf>> {
+    let mut out: Vec<PathBuf> = read_scan_registry()?
+        .into_iter()
+        .map(PathBuf::from)
+        .filter(|p| p.is_file())
+        .collect();
+    out.sort_by(|a, b| {
+        a.file_name()
+            .cmp(&b.file_name())
+            .then_with(|| a.cmp(b))
+    });
+    Ok(out)
+}
+
+fn match_known_todos(query: &[String]) -> Result<Vec<PathBuf>> {
+    let specs = parse_todo_specs(query);
+    let mut out: Vec<PathBuf> = known_todo_paths()?
+        .into_iter()
+        .filter(|p| match_todo_path(p.to_string_lossy().as_ref(), &specs))
+        .collect();
+    out.sort_by(|a, b| {
+        a.file_name()
+            .cmp(&b.file_name())
+            .then_with(|| a.cmp(b))
+    });
+    Ok(out)
+}
+
+/// Discover local todo files and register them in the known-todo database.
+fn discover_and_register(
+    ext: &str,
+    max_depth: usize,
+    include_hidden: bool,
+) -> Result<Vec<PathBuf>> {
+    let files = discover_taskpaper_files_with_options(ext, max_depth, include_hidden)?;
+    register_todo_paths(&files)?;
+    Ok(files)
+}
+
+/// Resolve todo file paths for commands that support `--in` / `--all` (known history).
+fn resolve_scoped_todo_paths(
+    cli: &Cli,
+    file: Option<&PathBuf>,
+    in_todo: &[String],
+    all: bool,
+    depth: usize,
+    hidden: bool,
+) -> Result<Vec<PathBuf>> {
+    if let Some(path) = file {
+        return Ok(vec![path.clone()]);
+    }
+    if let Some(path) = &cli.global_file {
+        return Ok(vec![path.clone()]);
+    }
+    if !in_todo.is_empty() {
+        let matched = match_known_todos(in_todo)?;
+        if matched.is_empty() {
+            anyhow::bail!("Todo not found");
+        }
+        return Ok(matched);
+    }
+    if all {
+        return known_todo_paths();
+    }
+    discover_and_register(&cli.extension, depth, hidden)
 }
 
 fn run_init(_cli: &Cli) -> Result<()> {
@@ -2822,26 +2945,15 @@ fn run_archive(cli: &Cli, args: &ArchiveArgs) -> Result<()> {
 }
 
 fn load_archive_todo_files(cli: &Cli, args: &ArchiveArgs) -> Result<Vec<TodoFile>> {
-    if let Some(path) = &args.file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
-    if let Some(path) = &cli.global_file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
-    let mut paths = discover_taskpaper_files_with_options(
-        &cli.extension,
+    let files = resolve_scoped_todo_paths(
+        cli,
+        args.file.as_ref(),
+        &args.in_todo,
+        false,
         effective_discovery_depth_usize(cli, args.depth, 1),
         false,
     )?;
-    if !args.in_todo.is_empty() {
-        let specs = parse_todo_specs(&args.in_todo);
-        paths.retain(|path| match_todo_path(path.to_string_lossy().as_ref(), &specs));
-    }
-    paths
+    files
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
         .collect()
@@ -2887,26 +2999,15 @@ fn collect_archive_candidates(files: &[TodoFile], args: &ArchiveArgs) -> Result<
 }
 
 fn load_update_todo_files(cli: &Cli, args: &UpdateArgs) -> Result<Vec<TodoFile>> {
-    if let Some(path) = &args.file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
-    if let Some(path) = &cli.global_file {
-        return TodoFile::load(path)
-            .with_context(|| format!("Failed to read {:?}", path))
-            .map(|todo| vec![todo]);
-    }
-    let mut paths = discover_taskpaper_files_with_options(
-        &cli.extension,
+    let files = resolve_scoped_todo_paths(
+        cli,
+        args.file.as_ref(),
+        &args.in_todo,
+        false,
         effective_discovery_depth_usize(cli, args.depth, 1),
         false,
     )?;
-    if !args.in_todo.is_empty() {
-        let specs = parse_todo_specs(&args.in_todo);
-        paths.retain(|path| match_todo_path(path.to_string_lossy().as_ref(), &specs));
-    }
-    paths
+    files
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
         .collect()
@@ -3521,20 +3622,15 @@ fn run_plugin(cli: &Cli, command: &PluginCommands) -> Result<()> {
             done,
             tagged,
         } => {
-            let mut files = if let Some(path) = file {
-                vec![TodoFile::load(path)?]
-            } else if let Some(path) = &cli.global_file {
-                vec![TodoFile::load(path)?]
-            } else {
-                let mut paths = discover_taskpaper_files_with_options(
-                    &cli.extension,
+            let mut files = {
+                let paths = resolve_scoped_todo_paths(
+                    cli,
+                    file.as_ref(),
+                    in_todo,
+                    false,
                     effective_discovery_depth(cli, depth.clone(), 5),
                     false,
                 )?;
-                if !in_todo.is_empty() {
-                    let specs = parse_todo_specs(in_todo);
-                    paths.retain(|p| match_todo_path(p.to_string_lossy().as_ref(), &specs));
-                }
                 paths
                     .iter()
                     .map(|p| TodoFile::load(p))
@@ -3647,15 +3743,16 @@ mod tests {
         omnifocus_auxiliary_tags_suffix, open_command_for_target, parse_multi_action_edit_output,
         parse_multi_selection, parse_one_based_selection, parse_priority_value, parse_tag_datetime,
         parse_tag_input, parse_todo_specs, prompt_profile_path, read_scan_registry,
-        restore_target_from_backup_path, run_archive, run_edit, run_move, run_plugin, run_prompt,
-        run_saved, run_scan, run_tag, run_undo, run_update, save_next_search, saved_search_path,
-        saved_search_slug, shell_quote_token, strip_trailing_note, update_has_mutation_flags,
-        update_seed_matches, write_scan_registry,
+        register_todo_paths, restore_target_from_backup_path, run_archive, run_edit, run_move,
+        run_plugin, run_prompt, run_saved, run_scan, run_tag, run_todos, run_undo, run_update,
+        save_next_search, saved_search_path, saved_search_slug, scan_registry_path,
+        known_todo_paths, shell_quote_token, strip_trailing_note,
+        update_has_mutation_flags, update_seed_matches, write_scan_registry,
     };
     use crate::cli::{
         AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs, NextArgs,
-        PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs, UndoArgs,
-        UpdateArgs,
+        PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs, TodosArgs,
+        UndoArgs, UpdateArgs,
     };
     use crate::io::xdg::TEST_ENV_MUTEX;
     use crate::models::action::Action;
@@ -4883,11 +4980,18 @@ Inbox:
         };
         let args = EditArgs {
             query: Some("Before edit".to_string()),
-            text: "After edit @na".to_string(),
+            text: Some("After edit @na".to_string()),
             file: None,
             depth: 1,
             in_todo: Vec::new(),
             search: Vec::new(),
+            tagged: Vec::new(),
+            done: false,
+            regex: false,
+            exact: false,
+            search_notes: true,
+            no_search_notes: false,
+            editor: None,
             all: true,
         };
         run_edit(&cli, &args).expect("run_edit should succeed");
@@ -5182,6 +5286,73 @@ Inbox:
     }
 
     #[test]
+    fn run_edit_without_text_requires_search_terms() {
+        let cli = Cli {
+            no_color: true,
+            ..Default::default()
+        };
+        let args = EditArgs {
+            query: None,
+            text: None,
+            file: None,
+            depth: 1,
+            in_todo: Vec::new(),
+            search: Vec::new(),
+            tagged: Vec::new(),
+            done: false,
+            regex: false,
+            exact: false,
+            search_notes: true,
+            no_search_notes: false,
+            editor: None,
+            all: false,
+        };
+        let err = run_edit(&cli, &args).expect_err("should require search terms");
+        assert!(
+            err.to_string().contains("No search terms"),
+            "{err}"
+        );
+    }
+
+    #[test]
+    fn register_and_run_todos_lists_known_paths() {
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let mut data_home = std::env::temp_dir();
+        data_home.push(format!(
+            "na_rust_todos_data_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_home).expect("data home");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        let path = write_fixture_taskpaper("Inbox:\n- One @na\n");
+        register_todo_paths(&[path.clone()]).expect("register");
+        let listed = known_todo_paths().expect("known");
+        assert!(
+            listed.iter().any(|p| p == &path),
+            "registry={listed:?} expected={path:?}"
+        );
+
+        let registry = scan_registry_path();
+        assert!(registry.ends_with("tdlist.txt"), "{registry:?}");
+
+        let cli = Cli {
+            no_color: true,
+            ..Default::default()
+        };
+        let args = TodosArgs {
+            query: Vec::new(),
+            edit: false,
+        };
+        run_todos(&cli, &args).expect("todos should list");
+
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_file(&path).ok();
+        fs::remove_dir_all(data_home).ok();
+    }
+
+    #[test]
     fn prompt_install_is_idempotent_for_profile_file() {
         let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
         let mut path = std::env::temp_dir();
@@ -5238,19 +5409,31 @@ Inbox:
 
     #[test]
     fn load_update_todo_files_filters_by_in_todo_tokens() {
-        let cwd = std::env::current_dir().expect("cwd should resolve");
-        let mut sandbox = cwd.clone();
-        let ts = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("valid monotonic time")
-            .as_nanos();
-        let seq = FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed);
-        sandbox.push(format!("na_rust_update_filter_fixture_{}_{}", ts, seq));
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
+        let mut data_home = std::env::temp_dir();
+        data_home.push(format!(
+            "na_rust_in_todo_data_{}_{}",
+            std::process::id(),
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
+        fs::create_dir_all(&data_home).expect("data home");
+        std::env::set_var("XDG_DATA_HOME", &data_home);
+
+        let mut sandbox = std::env::temp_dir();
+        sandbox.push(format!(
+            "na_rust_update_filter_fixture_{}",
+            FIXTURE_COUNTER.fetch_add(1, Ordering::Relaxed)
+        ));
         fs::create_dir_all(&sandbox).expect("sandbox should create");
         let keep = sandbox.join("keep_work_client.taskpaper");
         let drop = sandbox.join("drop_home_archive.taskpaper");
         fs::write(&keep, "Inbox:\n- Keep\n").expect("keep fixture should write");
         fs::write(&drop, "Inbox:\n- Drop\n").expect("drop fixture should write");
+
+        let mut seeded = HashSet::new();
+        seeded.insert(keep.to_string_lossy().to_string());
+        seeded.insert(drop.to_string_lossy().to_string());
+        write_scan_registry(&seeded).expect("seed registry");
 
         let cli = Cli {
             global_file: None,
@@ -5262,10 +5445,10 @@ Inbox:
         args.in_todo = vec!["work,+client,-archive".to_string()];
         args.depth = 3;
 
-        std::env::set_current_dir(&sandbox).expect("should enter sandbox");
         let files = load_update_todo_files(&cli, &args).expect("load should succeed");
-        std::env::set_current_dir(&cwd).expect("should restore cwd");
+        std::env::remove_var("XDG_DATA_HOME");
         fs::remove_dir_all(&sandbox).ok();
+        fs::remove_dir_all(&data_home).ok();
 
         let loaded_paths = files
             .iter()

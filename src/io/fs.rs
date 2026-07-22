@@ -4,6 +4,7 @@ use std::env;
 use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
+#[allow(dead_code)]
 pub fn discover_taskpaper_files(ext: &str) -> Result<Vec<PathBuf>> {
     discover_taskpaper_files_with_options(ext, 5, false)
 }

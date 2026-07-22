@@ -231,21 +231,33 @@ na update [QUERY] [OPTIONS]
 
 ### `edit`
 
-Replace action text directly (non-interactive).
+Open matched actions in `$EDITOR` for multi-action editing (Ruby-compatible `# ------ path:line` separators). After the editor exits, changes are written back to the todo file(s).
 
 ```
-na edit [QUERY] --text TEXT [OPTIONS]
+na edit [QUERY] [OPTIONS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `QUERY` | Action selector |
-| `--text` | Replacement action text (required) |
+| `QUERY` | Action selector (required unless `--tagged` / `--search` is used) |
+| `--text` | Replace action text directly instead of opening an editor |
 | `--file` | Restrict to a specific file |
 | `-d`, `--depth` | Search depth (default: 1) |
 | `--in`, `--todo` | Restrict to known todo files |
 | `--search`, `--find`, `--grep` | Additional filter |
-| `--all` | Edit all matches |
+| `--tagged` | Restrict by tag(s) |
+| `--done` | Include completed actions |
+| `-e`, `--regex` / `-x`, `--exact` | Match mode |
+| `--search-notes` / `--no-search-notes` | Include/exclude notes while searching |
+| `--editor` | Editor override |
+| `--all` | Edit all matches (skip menu) |
+
+Examples:
+
+```bash
+na edit "login bug"          # select match(es), open in $EDITOR
+na edit "login" --text "Fixed login @na"   # non-interactive replace
+```
 
 ### `complete`, `finish`
 
@@ -384,15 +396,16 @@ na projects [OPTIONS]
 
 ### `todos`
 
-List known todo files from the scan registry.
+List known todo files from the discovery registry (`tdlist.txt` under the NA data directory). Every time `na` finds todo files in the current tree (or you run `na scan`), their absolute paths are recorded so you can list or target them from anywhere.
 
 ```
-na todos [OPTIONS]
+na todos [QUERY ...] [OPTIONS]
 ```
 
 | Flag | Description |
 |------|-------------|
-| `-e`, `--edit` | Open the registry file in an editor |
+| `QUERY` | Optional fuzzy path tokens (`na todos marked`, `na todos code/marked`) |
+| `-e`, `--edit` | Open the registry file itself in `$EDITOR` |
 
 ### `undo`
 

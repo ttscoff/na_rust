@@ -665,9 +665,10 @@ pub struct EditArgs {
     #[arg(value_name = "QUERY")]
     pub query: Option<String>,
 
-    /// Set replacement action text.
+    /// Replace action text directly (non-interactive). Without this flag,
+    /// matched actions are opened in `$EDITOR` for multi-action editing.
     #[arg(long = "text", value_name = "TEXT")]
-    pub text: String,
+    pub text: Option<String>,
 
     /// Restrict edits to a specific file path.
     #[arg(long, value_name = "PATH")]
@@ -684,6 +685,34 @@ pub struct EditArgs {
     /// Additional search terms used as a fallback filter.
     #[arg(long = "search", visible_aliases = ["find", "grep"], value_name = "QUERY", num_args = 0..)]
     pub search: Vec<String>,
+
+    /// Match actions containing tag expressions.
+    #[arg(long = "tagged", value_name = "TAG", num_args = 0..)]
+    pub tagged: Vec<String>,
+
+    /// Include completed (`@done`) actions.
+    #[arg(long = "done", default_value_t = false)]
+    pub done: bool,
+
+    /// Treat search as regular expression.
+    #[arg(short = 'e', long = "regex", default_value_t = false)]
+    pub regex: bool,
+
+    /// Exact phrase match.
+    #[arg(short = 'x', long = "exact", default_value_t = false)]
+    pub exact: bool,
+
+    /// Include notes while searching (default: true).
+    #[arg(long = "search-notes", default_value_t = true)]
+    pub search_notes: bool,
+
+    /// Exclude notes while searching.
+    #[arg(long = "no-search-notes", default_value_t = false)]
+    pub no_search_notes: bool,
+
+    /// Editor override (default: `$EDITOR` / `$GIT_EDITOR`).
+    #[arg(long = "editor", value_name = "EDITOR")]
+    pub editor: Option<String>,
 
     /// Edit all matched actions.
     #[arg(long, default_value_t = false)]
@@ -1004,6 +1033,11 @@ pub struct ProjectsArgs {
 
 #[derive(Debug, Args, Clone)]
 pub struct TodosArgs {
+    /// Fuzzy-match known todo files (path tokens). Separate with `/`, `:`, or spaces.
+    #[arg(value_name = "QUERY", num_args = 0..)]
+    pub query: Vec<String>,
+
+    /// Open the known-todo database (`tdlist.txt`) in `$EDITOR`.
     #[arg(short = 'e', long = "edit", default_value_t = false)]
     pub edit: bool,
 }
@@ -1459,7 +1493,7 @@ mod tests {
         match cli.command {
             Some(Commands::Edit(args)) => {
                 assert_eq!(args.query.as_deref(), Some("task text"));
-                assert_eq!(args.text, "new body");
+                assert_eq!(args.text.as_deref(), Some("new body"));
                 assert_eq!(args.file, Some(PathBuf::from("tasks.taskpaper")));
                 assert_eq!(args.in_todo, vec!["work".to_string()]);
                 assert_eq!(args.search, vec!["needle".to_string()]);

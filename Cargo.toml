@@ -1,6 +1,6 @@
 [package]
 name = "na_rust"
-version = "1.0.2"
+version = "1.0.3"
 edition = "2021"
 description = "A command line tool for adding and listing project todos (Rust rewrite of na)"
 license = "MIT"
