@@ -77,15 +77,9 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
-    use std::sync::{Mutex, OnceLock};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
-    static CWD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-
-    fn cwd_lock() -> &'static Mutex<()> {
-        CWD_LOCK.get_or_init(|| Mutex::new(()))
-    }
 
     fn fixture_dir() -> PathBuf {
         let mut path = std::env::temp_dir();
@@ -118,7 +112,7 @@ mod tests {
 
     #[test]
     fn discover_taskpaper_files_respects_depth_and_hidden_options() {
-        let _guard = cwd_lock().lock().expect("cwd lock should be available");
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
         let root = fixture_dir();
         fs::create_dir_all(root.join("nested").join("deep")).expect("fixture dir should create");
         fs::create_dir_all(root.join(".hidden")).expect("hidden fixture dir should create");
@@ -155,7 +149,7 @@ mod tests {
     #[cfg(unix)]
     #[test]
     fn discover_taskpaper_files_includes_symlinked_files() {
-        let _guard = cwd_lock().lock().expect("cwd lock should be available");
+        let _env_guard = TEST_ENV_MUTEX.lock().expect("env mutex");
         let root = fixture_dir();
         fs::create_dir_all(&root).expect("fixture dir should create");
         fs::write(root.join("real.taskpaper"), "Inbox:\n").expect("real fixture write");

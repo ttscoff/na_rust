@@ -436,10 +436,13 @@ na scan [OPTIONS]
 
 ### `init`, `create`
 
-Create a new todo file in the current directory.
+Create a new todo file in the current directory, named after the optional project
+argument (or the git repo / directory name). Uses the built-in blank template
+(or `--template` when set).
 
 ```
 na init
+na init warpspeed
 ```
 
 ### `prompt`

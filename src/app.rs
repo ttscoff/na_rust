@@ -1,11 +1,14 @@
 use crate::cli::{
-    AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, InitConfigArgs,
+    AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, InitArgs, InitConfigArgs,
     MoveArgs, NextArgs,
     OpenArgs, PluginCommands, ProjectsArgs, PromptArgs, PromptCommands, SavedCommands, ScanArgs,
     TagArgs, TaggedArgs, TodosArgs, UndoArgs, UpdateArgs, legacy_global_add_extras_from_argv,
 };
 use crate::io::fs::discover_taskpaper_files_with_options;
 use crate::io::config::{find_na_rc_path, rc_globals_from_cli, write_na_rc};
+use crate::io::git::{
+    confirm_create, create_todo, default_new_todo_target, default_todo_basename,
+};
 use crate::io::xdg::{na_backup_dir, na_data_dir};
 use crate::models::action::Action;
 use crate::models::todo::{TodoFile, UpdateMutation};
@@ -195,7 +198,7 @@ pub fn run(cli: Cli) -> Result<()> {
         Some(Commands::Todos(args)) => run_todos(&cli, args),
         Some(Commands::Undo(args)) => run_undo(&cli, args),
         Some(Commands::Scan(args)) => run_scan(&cli, args),
-        Some(Commands::Init) => run_init(&cli),
+        Some(Commands::Init(args)) => run_init(&cli, args),
         Some(Commands::Prompt(args)) => run_prompt(&cli, args),
         Some(Commands::Changes) => run_changes(&cli),
         Some(Commands::Saved(args)) => run_saved(&args.command),
@@ -1503,14 +1506,74 @@ fn choose_add_file_index(files: &[TodoFile], interactive: bool) -> Result<usize>
 
 fn load_add_todo_files(cli: &Cli, args: &AddArgs) -> Result<Vec<TodoFile>> {
     let depth = effective_discovery_depth(cli, args.depth, 1);
-    let files = resolve_scoped_todo_paths(
-        cli,
-        args.file.as_ref(),
-        &args.in_todo,
-        false,
-        depth,
-        false,
-    )?;
+    let na_tag = cli_na_tag(cli);
+    let template = cli.template.as_deref();
+
+    // Missing --file / --global-file: prompt to create (Ruby `add`).
+    if let Some(path) = args.file.as_ref().or(cli.global_file.as_ref()) {
+        if !path.is_file() {
+            let create = confirm_create("Specified file not found, create it")?;
+            if !create {
+                anyhow::bail!("Cancelled");
+            }
+            let basename = path
+                .file_stem()
+                .and_then(|s| s.to_str())
+                .unwrap_or("todo");
+            create_todo(path, basename, template, na_tag)?;
+            register_todo_paths(&[path.clone()])?;
+        }
+        return Ok(vec![TodoFile::load(path)
+            .with_context(|| format!("Failed to read {:?}", path))?]);
+    }
+
+    // --in / --todo: match known todos, or prompt to create `{token}.{ext}`.
+    if !args.in_todo.is_empty() {
+        let matched = match_known_todos(&args.in_todo)?;
+        if !matched.is_empty() {
+            return matched
+                .iter()
+                .map(|path| {
+                    TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path))
+                })
+                .collect();
+        }
+        let joined = args.in_todo.join(" ");
+        let stem = strip_file_extension_suffix(joined.trim(), &cli.extension);
+        let target = PathBuf::from(format!("{stem}.{}", cli.extension));
+        let abs = absolutize_todo_path(&target);
+        if !abs.is_file() {
+            let create = confirm_create(&format!(
+                "Specified file not found, create {}.{}?",
+                stem, cli.extension
+            ))?;
+            if !create {
+                anyhow::bail!("Cancelled");
+            }
+            let basename = Path::new(&stem)
+                .file_name()
+                .and_then(|s| s.to_str())
+                .unwrap_or(stem.as_str());
+            create_todo(&abs, basename, template, na_tag)?;
+            register_todo_paths(&[abs.clone()])?;
+        }
+        return Ok(vec![TodoFile::load(&abs)
+            .with_context(|| format!("Failed to read {:?}", abs))?]);
+    }
+
+    let files = resolve_scoped_todo_paths(cli, None, &[], false, depth, false)?;
+    if files.is_empty() {
+        let create = confirm_create("No todo file found, create one")?;
+        if !create {
+            anyhow::bail!("Cancelled");
+        }
+        let (path, basename) = default_new_todo_target(&cli.extension)?;
+        create_todo(&path, &basename, template, na_tag)?;
+        register_todo_paths(&[path.clone()])?;
+        return Ok(vec![TodoFile::load(&path)
+            .with_context(|| format!("Failed to read {:?}", path))?]);
+    }
+
     files
         .iter()
         .map(|path| TodoFile::load(path).with_context(|| format!("Failed to read {:?}", path)))
@@ -2788,13 +2851,47 @@ fn resolve_scoped_todo_paths(
     discover_and_register(&cli.extension, depth, hidden)
 }
 
-fn run_init(_cli: &Cli) -> Result<()> {
-    let path = PathBuf::from("todo.taskpaper");
-    if path.exists() {
-        anyhow::bail!("todo.taskpaper already exists");
+fn run_init(cli: &Cli, args: &InitArgs) -> Result<()> {
+    let interactive = std::io::stdin().is_terminal() && std::io::stdout().is_terminal();
+    let mut project = if args.project.is_empty() {
+        default_todo_basename()?
+    } else {
+        args.project.join(" ")
+    };
+    if args.project.is_empty() && interactive {
+        project = Text::new("Project name")
+            .with_initial_value(&project)
+            .prompt()
+            .unwrap_or(project);
     }
-    fs::write(&path, "Inbox:\n").with_context(|| format!("Failed writing {:?}", path))?;
-    println!("Created {}", path.display());
+    let project = project.trim();
+    if project.is_empty() {
+        anyhow::bail!("Project name cannot be empty");
+    }
+    let path = PathBuf::from(format!("{project}.{}", cli.extension));
+    if path.exists() {
+        let overwrite = if interactive {
+            Confirm::new(&format!(
+                "File {} already exists, overwrite it?",
+                path.display()
+            ))
+            .with_default(false)
+            .prompt()
+            .unwrap_or(false)
+        } else {
+            false
+        };
+        if !overwrite {
+            anyhow::bail!("Cancelled");
+        }
+    }
+    create_todo(
+        &path,
+        project,
+        cli.template.as_deref(),
+        cli_na_tag(cli),
+    )?;
+    register_todo_paths(&[path])?;
     Ok(())
 }
 
@@ -3743,16 +3840,17 @@ mod tests {
         omnifocus_auxiliary_tags_suffix, open_command_for_target, parse_multi_action_edit_output,
         parse_multi_selection, parse_one_based_selection, parse_priority_value, parse_tag_datetime,
         parse_tag_input, parse_todo_specs, prompt_profile_path, read_scan_registry,
-        register_todo_paths, restore_target_from_backup_path, run_archive, run_edit, run_move,
+        register_todo_paths, restore_target_from_backup_path, run_archive, run_edit, run_init,
+        run_move, load_add_todo_files,
         run_plugin, run_prompt, run_saved, run_scan, run_tag, run_todos, run_undo, run_update,
         save_next_search, saved_search_path, saved_search_slug, scan_registry_path,
         known_todo_paths, shell_quote_token, strip_trailing_note,
         update_has_mutation_flags, update_seed_matches, write_scan_registry,
     };
     use crate::cli::{
-        AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, MoveArgs, NextArgs,
-        PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs, TodosArgs,
-        UndoArgs, UpdateArgs,
+        AddArgs, ArchiveArgs, Cli, Commands, CompletedArgs, EditArgs, FindArgs, InitArgs, MoveArgs,
+        NextArgs, PluginCommands, PromptArgs, PromptCommands, SavedCommands, ScanArgs, TagArgs,
+        TodosArgs, UndoArgs, UpdateArgs,
     };
     use crate::io::xdg::TEST_ENV_MUTEX;
     use crate::models::action::Action;
@@ -3764,9 +3862,16 @@ mod tests {
     use std::fs;
     use std::path::{Path, PathBuf};
     use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::{MutexGuard, PoisonError};
     use std::time::{SystemTime, UNIX_EPOCH};
 
     static FIXTURE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+    fn env_lock() -> MutexGuard<'static, ()> {
+        TEST_ENV_MUTEX
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
 
     fn base_next_args() -> NextArgs {
         NextArgs {
@@ -4148,6 +4253,7 @@ ProjectB:
 
     #[test]
     fn add_with_global_file_uses_cwd_as_project() {
+        let _env_guard = env_lock();
         let sandbox = std::env::temp_dir().join(format!(
             "na-add-cwd-{}",
             std::time::SystemTime::now()
@@ -4170,6 +4276,132 @@ ProjectB:
         fs::remove_dir_all(&sandbox).ok();
         assert_eq!(project, sandbox.file_name().unwrap().to_string_lossy());
         assert!(text.contains("@na"));
+    }
+
+    #[test]
+    fn add_creates_project_named_todo_when_none_found() {
+        let _env_guard = env_lock();
+        let name = format!(
+            "na_add_create_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sandbox = std::env::temp_dir().join(&name);
+        fs::create_dir_all(&sandbox).expect("sandbox");
+        let xdg = sandbox.join("xdg");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&sandbox).expect("chdir");
+
+        let cli = Cli::default();
+        let args = match Cli::parse_from(["na", "add", "x"]).command {
+            Some(Commands::Add(a)) => a,
+            _ => panic!("expected add"),
+        };
+
+        let files = load_add_todo_files(&cli, &args).expect("should create todo");
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].path.ends_with(format!("{name}.taskpaper")),
+            "unexpected path {:?}",
+            files[0].path
+        );
+        assert!(files[0].path.is_file());
+        let body = fs::read_to_string(&files[0].path).expect("read created");
+        assert!(body.contains("Inbox:"));
+        assert!(body.contains(&format!("{name}:")));
+        assert!(body.contains("Feature Requests:"));
+        assert!(body.contains("Search Definitions:"));
+
+        std::env::set_current_dir(old).expect("restore");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_dir_all(&sandbox).ok();
+    }
+
+    #[test]
+    fn add_creates_todo_at_git_root_named_after_repo() {
+        let _env_guard = env_lock();
+        let name = format!(
+            "na_git_create_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        );
+        let sandbox = std::env::temp_dir().join(&name);
+        let nested = sandbox.join("src");
+        fs::create_dir_all(&nested).expect("sandbox");
+        let xdg = sandbox.join("xdg");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+        std::process::Command::new("git")
+            .args(["init"])
+            .current_dir(&sandbox)
+            .output()
+            .expect("git init");
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&nested).expect("chdir nested");
+
+        let cli = Cli::default();
+        let args = match Cli::parse_from(["na", "add", "x"]).command {
+            Some(Commands::Add(a)) => a,
+            _ => panic!("expected add"),
+        };
+        let files = load_add_todo_files(&cli, &args).expect("should create at repo root");
+        assert_eq!(files.len(), 1);
+        assert!(
+            files[0].path.ends_with(format!("{name}.taskpaper")),
+            "unexpected path {:?}",
+            files[0].path
+        );
+        assert!(sandbox.join(format!("{name}.taskpaper")).is_file());
+        assert!(!nested.join(format!("{name}.taskpaper")).is_file());
+
+        std::env::set_current_dir(old).expect("restore");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_dir_all(&sandbox).ok();
+    }
+
+    #[test]
+    fn init_creates_named_todo_with_template() {
+        let _env_guard = env_lock();
+        let sandbox = std::env::temp_dir().join(format!(
+            "na_init_{}",
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        fs::create_dir_all(&sandbox).expect("sandbox");
+        let xdg = sandbox.join("xdg");
+        std::env::set_var("XDG_DATA_HOME", &xdg);
+        let old = std::env::current_dir().expect("cwd");
+        std::env::set_current_dir(&sandbox).expect("chdir");
+
+        let cli = Cli::default();
+        let args = InitArgs {
+            project: vec!["warpspeed".to_string()],
+        };
+        run_init(&cli, &args).expect("init");
+        let path = sandbox.join("warpspeed.taskpaper");
+        let body = fs::read_to_string(&path).expect("read");
+        assert!(body.contains("warpspeed:"));
+        assert!(body.contains("Bugs:"));
+        assert!(body.contains("@search(@na and not @done"));
+
+        std::env::set_current_dir(old).expect("restore");
+        std::env::remove_var("XDG_DATA_HOME");
+        fs::remove_dir_all(&sandbox).ok();
+    }
+
+    #[test]
+    fn init_command_parses_optional_project_name() {
+        let cli = Cli::parse_from(["na", "init", "warpspeed"]);
+        match cli.command {
+            Some(Commands::Init(args)) => assert_eq!(args.project, vec!["warpspeed".to_string()]),
+            _ => panic!("expected init"),
+        }
     }
 
     #[test]

@@ -149,7 +149,7 @@ pub enum Commands {
     Scan(ScanArgs),
     /// Initialize a new todo file.
     #[command(visible_alias = "create")]
-    Init,
+    Init(InitArgs),
     /// Show prompt scripts.
     Prompt(PromptArgs),
     /// Show changelog.
@@ -162,6 +162,13 @@ pub enum Commands {
     InitConfig(InitConfigArgs),
     /// Inspect or run plugins.
     Plugin(PluginArgs),
+}
+
+#[derive(Debug, Clone, Args)]
+pub struct InitArgs {
+    /// Project name for the new todo file (defaults to git repo / directory name).
+    #[arg(value_name = "PROJECT")]
+    pub project: Vec<String>,
 }
 
 #[derive(Debug, Args)]
